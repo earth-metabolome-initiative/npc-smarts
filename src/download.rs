@@ -1,9 +1,8 @@
 use std::fs;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use zenodo_rs::{Auth, RecordId, ZenodoClient, ZenodoError};
 
@@ -125,28 +124,11 @@ fn temporary_download_path(path: &Path) -> PathBuf {
 }
 
 fn download_progress_bar(total_files: usize) -> ProgressBar {
-    let progress_bar = match terminal_progress_draw_target(20) {
-        Some(draw_target) => {
-            ProgressBar::with_draw_target(Some(usize_to_u64(total_files)), draw_target)
-        }
-        None => ProgressBar::hidden(),
-    };
+    let progress_bar = ProgressBar::new(usize_to_u64(total_files));
     progress_bar.set_style(download_progress_style());
     progress_bar.enable_steady_tick(Duration::from_millis(100));
     progress_bar.set_message("dataset | checking required files");
     progress_bar
-}
-
-fn terminal_progress_draw_target(refresh_rate: u8) -> Option<ProgressDrawTarget> {
-    if std::io::stderr().is_terminal() {
-        return Some(ProgressDrawTarget::stderr_with_hz(refresh_rate));
-    }
-
-    if std::io::stdout().is_terminal() {
-        return Some(ProgressDrawTarget::stdout_with_hz(refresh_rate));
-    }
-
-    None
 }
 
 fn download_progress_style() -> ProgressStyle {
@@ -164,11 +146,6 @@ fn usize_to_u64(value: usize) -> u64 {
 }
 
 fn log_progress_line(progress_bar: &ProgressBar, message: String) {
-    if progress_bar.is_hidden() {
-        eprintln!("{message}");
-        return;
-    }
-
     progress_bar.println(message);
 }
 
