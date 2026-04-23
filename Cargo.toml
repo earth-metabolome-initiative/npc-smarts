@@ -1,0 +1,47 @@
+[package]
+name = "npc-smarts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+description = "End-to-end NPC SMARTS evolution over the published distilled teacher splits."
+repository = "https://github.com/earth-metabolome-initiative/npc-smarts"
+readme = "README.md"
+keywords = ["smarts", "chemistry", "npc", "zenodo", "evolution"]
+categories = ["science", "command-line-utilities"]
+
+[dependencies]
+arrow-array = "56.2.0"
+arrow-schema = "56.2.0"
+clap = { version = "4.5.39", features = ["derive"] }
+indicatif = "0.17.11"
+parquet = { version = "56.2.0", default-features = false, features = ["arrow", "zstd"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+smarts-evolution = { git = "https://github.com/earth-metabolome-initiative/smarts-evolution", branch = "main" }
+smarts-rs = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main" }
+smiles-parser = { git = "https://github.com/earth-metabolome-initiative/smiles-parser", branch = "main", default-features = false }
+thiserror = "2.0.18"
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
+zenodo-rs = { version = "0.1.6", features = ["checksums"] }
+
+[lints.clippy]
+all = { level = "deny", priority = -3 }
+pedantic = { level = "deny", priority = -2 }
+cargo = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+multiple_crate_versions = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+overflow-checks = false
