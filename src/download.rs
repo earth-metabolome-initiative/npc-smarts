@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::Serialize;
 use zenodo_rs::{Auth, RecordId, ZenodoClient, ZenodoError};
 
@@ -79,6 +79,7 @@ pub async fn ensure_distillation_dataset(
             });
             progress_bar.set_message(format!("dataset | skipping {key}"));
             progress_bar.inc(1);
+            log_progress_line(&progress_bar, format!("[skip] {key} | already present"));
             continue;
         }
 
@@ -103,10 +104,10 @@ pub async fn ensure_distillation_dataset(
             skipped: false,
         });
         progress_bar.inc(1);
-        progress_bar.println(format!(
-            "[download] {key} | {} bytes",
-            resolved.bytes_written
-        ));
+        log_progress_line(
+            &progress_bar,
+            format!("[download] {key} | {} bytes", resolved.bytes_written),
+        );
     }
 
     progress_bar.finish_with_message(format!(
@@ -124,15 +125,28 @@ fn temporary_download_path(path: &Path) -> PathBuf {
 }
 
 fn download_progress_bar(total_files: usize) -> ProgressBar {
-    let progress_bar = if std::io::stderr().is_terminal() {
-        ProgressBar::new(usize_to_u64(total_files))
-    } else {
-        ProgressBar::hidden()
+    let progress_bar = match terminal_progress_draw_target(20) {
+        Some(draw_target) => {
+            ProgressBar::with_draw_target(Some(usize_to_u64(total_files)), draw_target)
+        }
+        None => ProgressBar::hidden(),
     };
     progress_bar.set_style(download_progress_style());
     progress_bar.enable_steady_tick(Duration::from_millis(100));
     progress_bar.set_message("dataset | checking required files");
     progress_bar
+}
+
+fn terminal_progress_draw_target(refresh_rate: u8) -> Option<ProgressDrawTarget> {
+    if std::io::stderr().is_terminal() {
+        return Some(ProgressDrawTarget::stderr_with_hz(refresh_rate));
+    }
+
+    if std::io::stdout().is_terminal() {
+        return Some(ProgressDrawTarget::stdout_with_hz(refresh_rate));
+    }
+
+    None
 }
 
 fn download_progress_style() -> ProgressStyle {
@@ -147,6 +161,15 @@ fn download_progress_style() -> ProgressStyle {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn log_progress_line(progress_bar: &ProgressBar, message: String) {
+    if progress_bar.is_hidden() {
+        eprintln!("{message}");
+        return;
+    }
+
+    progress_bar.println(message);
 }
 
 #[cfg(test)]
