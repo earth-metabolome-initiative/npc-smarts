@@ -4,7 +4,9 @@ use std::path::Path;
 use arrow_array::cast::{as_list_array, as_primitive_array, as_string_array};
 use arrow_array::types::Int64Type;
 use arrow_array::{Array, RecordBatch, UInt16Array};
+use indicatif::ProgressBar;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use smarts_evolution::{FoldData, FoldSample};
 use smarts_rs::PreparedTarget;
@@ -98,41 +100,44 @@ impl DatasetSplit {
     /// are missing, if labels are malformed, or if any SMILES row cannot be
     /// parsed into a prepared target.
     pub fn load(path: &Path, name: impl Into<String>) -> Result<Self, ExperimentError> {
+        let progress_bar = ProgressBar::hidden();
+        Self::load_with_progress(path, name, &progress_bar)
+    }
+
+    /// Load one published parquet split while updating a progress bar by row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parquet file cannot be read, if required columns
+    /// are missing, if labels are malformed, or if any SMILES row cannot be
+    /// parsed into a prepared target.
+    pub fn load_with_progress(
+        path: &Path,
+        name: impl Into<String>,
+        progress_bar: &ProgressBar,
+    ) -> Result<Self, ExperimentError> {
         let name = name.into();
         let file = File::open(path)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let total_rows =
+            usize::try_from(builder.metadata().file_metadata().num_rows()).map_err(|error| {
+                ExperimentError::InvalidDataset(format!(
+                    "split {name} reported an invalid row count: {error}"
+                ))
+            })?;
+        progress_bar.set_length(usize_to_u64(total_rows));
+        progress_bar.set_position(0);
+        progress_bar.set_message(format!("{name} | loading parquet batches"));
+        let reader = builder.build()?;
 
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(total_rows);
         for batch in reader {
             let batch =
                 batch.map_err(|error| ExperimentError::InvalidDataset(error.to_string()))?;
-            let smiles_array = as_string_array(column(&batch, &name, "smiles")?);
-            let cid_array = as_primitive_array::<Int64Type>(column(&batch, &name, "cid")?);
-            let pathway_view = label_column(&batch, &name, "pathway_ids")?;
-            let superclass_view = label_column(&batch, &name, "superclass_ids")?;
-            let class_view = label_column(&batch, &name, "class_ids")?;
-
-            for row_index in 0..batch.num_rows() {
-                let cid = cid_array.value(row_index);
-                let smiles = smiles_array.value(row_index).to_owned();
-                let parsed =
-                    smiles
-                        .parse::<Smiles>()
-                        .map_err(|error| ExperimentError::InvalidSmiles {
-                            split: name.clone(),
-                            cid,
-                            smiles: smiles.clone(),
-                            message: error.to_string(),
-                        })?;
-                rows.push(SplitRow {
-                    cid,
-                    smiles,
-                    target: PreparedTarget::new(parsed),
-                    pathway_ids: pathway_view.values(row_index)?,
-                    superclass_ids: superclass_view.values(row_index)?,
-                    class_ids: class_view.values(row_index)?,
-                });
-            }
+            progress_bar.set_message(format!("{name} | preparing SMARTS targets"));
+            let prepared_rows = prepare_batch_rows(&batch, &name)?;
+            progress_bar.inc(usize_to_u64(prepared_rows.len()));
+            rows.extend(prepared_rows);
         }
 
         if rows.is_empty() {
@@ -246,6 +251,69 @@ impl LabelColumnView<'_> {
         })?;
         Ok(self.values.values()[start..end].to_vec())
     }
+}
+
+struct RawSplitRow {
+    cid: i64,
+    smiles: String,
+    pathway_ids: Vec<u16>,
+    superclass_ids: Vec<u16>,
+    class_ids: Vec<u16>,
+}
+
+fn prepare_batch_rows(batch: &RecordBatch, split: &str) -> Result<Vec<SplitRow>, ExperimentError> {
+    let smiles_array = as_string_array(column(batch, split, "smiles")?);
+    let cid_array = as_primitive_array::<Int64Type>(column(batch, split, "cid")?);
+    let pathway_view = label_column(batch, split, "pathway_ids")?;
+    let superclass_view = label_column(batch, split, "superclass_ids")?;
+    let class_view = label_column(batch, split, "class_ids")?;
+
+    let raw_rows = (0..batch.num_rows())
+        .map(|row_index| {
+            Ok(RawSplitRow {
+                cid: cid_array.value(row_index),
+                smiles: smiles_array.value(row_index).to_owned(),
+                pathway_ids: pathway_view.values(row_index)?,
+                superclass_ids: superclass_view.values(row_index)?,
+                class_ids: class_view.values(row_index)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ExperimentError>>()?;
+
+    raw_rows
+        .into_par_iter()
+        .map(|row| prepare_raw_row(row, split))
+        .collect()
+}
+
+fn prepare_raw_row(row: RawSplitRow, split: &str) -> Result<SplitRow, ExperimentError> {
+    let RawSplitRow {
+        cid,
+        smiles,
+        pathway_ids,
+        superclass_ids,
+        class_ids,
+    } = row;
+    let parsed = smiles
+        .parse::<Smiles>()
+        .map_err(|error| ExperimentError::InvalidSmiles {
+            split: split.to_owned(),
+            cid,
+            smiles: smiles.clone(),
+            message: error.to_string(),
+        })?;
+    Ok(SplitRow {
+        cid,
+        smiles,
+        target: PreparedTarget::new(parsed),
+        pathway_ids,
+        superclass_ids,
+        class_ids,
+    })
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

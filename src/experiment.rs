@@ -1,11 +1,11 @@
 use std::cmp::Ordering;
 use std::fs::{self, File, OpenOptions};
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Serialize;
 use smarts_evolution::{
     EvolutionConfig as SmartsEvolutionConfig, EvolutionError, EvolutionProgress, EvolutionStatus,
@@ -212,38 +212,83 @@ struct LoadedInputs {
     test: DatasetSplit,
 }
 
+struct InputLoadProgress {
+    overall_bar: ProgressBar,
+    split_bar: ProgressBar,
+}
+
+impl InputLoadProgress {
+    fn new() -> Self {
+        let multi_progress = MultiProgress::new();
+        multi_progress.set_move_cursor(true);
+
+        let overall_bar = multi_progress.add(ProgressBar::new(4));
+        overall_bar.set_style(input_overall_progress_style());
+        overall_bar.set_message("starting input preparation");
+
+        let split_bar = multi_progress.add(ProgressBar::new(1));
+        split_bar.set_style(input_split_progress_style());
+        split_bar.enable_steady_tick(Duration::from_millis(100));
+        split_bar.set_message("waiting for first split");
+
+        Self {
+            overall_bar,
+            split_bar,
+        }
+    }
+
+    fn load_vocabulary(&self, path: &Path) -> Result<Vocabulary, ExperimentError> {
+        self.overall_bar.set_message("vocabulary".to_owned());
+        self.split_bar.set_length(1);
+        self.split_bar.set_position(0);
+        self.split_bar
+            .set_message("vocabulary | loading labels".to_owned());
+        self.split_bar.tick();
+
+        let vocabulary = Vocabulary::load(path)?;
+        self.overall_bar.inc(1);
+        Ok(vocabulary)
+    }
+
+    fn load_split(&self, path: &Path, name: &str) -> Result<DatasetSplit, ExperimentError> {
+        self.overall_bar.set_message(name.to_owned());
+
+        let split = DatasetSplit::load_with_progress(path, name, &self.split_bar)?;
+        self.overall_bar
+            .println(format!("[done] {name} | rows={}", split.len()));
+        self.overall_bar.inc(1);
+        Ok(split)
+    }
+
+    fn finish(&self) {
+        self.split_bar.finish_and_clear();
+        self.overall_bar
+            .finish_with_message("inputs ready".to_owned());
+    }
+}
+
 struct ExperimentProgress {
-    visible: bool,
     overall_bar: ProgressBar,
     task_bar: ProgressBar,
 }
 
 impl ExperimentProgress {
     fn new(total_tasks: usize) -> Self {
-        if let Some(draw_target) = terminal_progress_draw_target(15) {
-            let multi_progress = MultiProgress::with_draw_target(draw_target);
-            multi_progress.set_move_cursor(true);
+        let multi_progress = MultiProgress::new();
+        multi_progress.set_move_cursor(true);
 
-            let overall_bar = multi_progress.add(ProgressBar::new(usize_to_u64(total_tasks)));
-            overall_bar.set_style(overall_progress_style());
-            overall_bar.set_message("starting label sweep");
+        let overall_bar = multi_progress.add(ProgressBar::new(usize_to_u64(total_tasks)));
+        overall_bar.set_style(overall_progress_style());
+        overall_bar.set_message("starting label sweep");
 
-            let task_bar = multi_progress.add(ProgressBar::new(1));
-            task_bar.set_style(task_progress_style());
-            task_bar.enable_steady_tick(Duration::from_millis(100));
-            task_bar.set_message("waiting for first label");
-
-            return Self {
-                visible: true,
-                overall_bar,
-                task_bar,
-            };
-        }
+        let task_bar = multi_progress.add(ProgressBar::new(1));
+        task_bar.set_style(task_progress_style());
+        task_bar.enable_steady_tick(Duration::from_millis(100));
+        task_bar.set_message("waiting for first label");
 
         Self {
-            visible: false,
-            overall_bar: ProgressBar::hidden(),
-            task_bar: ProgressBar::hidden(),
+            overall_bar,
+            task_bar,
         }
     }
 
@@ -254,20 +299,13 @@ impl ExperimentProgress {
         validation_len: usize,
         test_len: usize,
     ) {
-        if self.visible {
-            self.overall_bar.set_message(task_name.to_owned());
-            self.task_bar.set_length(1);
-            self.task_bar.set_position(0);
-            self.task_bar.set_message(format!(
-                "{task_name} | preparing folds | train={train_len} validation={validation_len} test={test_len}"
-            ));
-            self.task_bar.tick();
-            return;
-        }
-
-        eprintln!(
-            "[start] {task_name} | train={train_len} validation={validation_len} test={test_len}"
-        );
+        self.overall_bar.set_message(task_name.to_owned());
+        self.task_bar.set_length(1);
+        self.task_bar.set_position(0);
+        self.task_bar.set_message(format!(
+            "{task_name} | preparing folds | train={train_len} validation={validation_len} test={test_len}"
+        ));
+        self.task_bar.tick();
     }
 
     fn log_skip(&self, task_name: &str, reason: &str) {
@@ -297,12 +335,7 @@ impl ExperimentProgress {
     }
 
     fn log_line(&self, message: String) {
-        if self.visible {
-            self.overall_bar.println(message);
-            return;
-        }
-
-        eprintln!("{message}");
+        self.overall_bar.println(message);
     }
 }
 
@@ -349,12 +382,19 @@ pub async fn run_experiment(
 
 async fn load_inputs(config: &ExperimentConfig) -> Result<LoadedInputs, ExperimentError> {
     let downloaded_files = ensure_distillation_dataset(&config.data_dir).await?;
+    let loading_progress = InputLoadProgress::new();
+    let vocabulary = loading_progress.load_vocabulary(&config.data_dir.join("vocabulary.json"))?;
+    let train = loading_progress.load_split(&config.data_dir.join("train.parquet"), "train")?;
+    let validation =
+        loading_progress.load_split(&config.data_dir.join("validation.parquet"), "validation")?;
+    let test = loading_progress.load_split(&config.data_dir.join("test.parquet"), "test")?;
+    loading_progress.finish();
     Ok(LoadedInputs {
         downloaded_files,
-        vocabulary: Vocabulary::load(&config.data_dir.join("vocabulary.json"))?,
-        train: DatasetSplit::load(&config.data_dir.join("train.parquet"), "train")?,
-        validation: DatasetSplit::load(&config.data_dir.join("validation.parquet"), "validation")?,
-        test: DatasetSplit::load(&config.data_dir.join("test.parquet"), "test")?,
+        vocabulary,
+        train,
+        validation,
+        test,
     })
 }
 
@@ -462,20 +502,13 @@ fn run_label_task(
     let validation_evaluator = SmartsEvaluator::new(vec![validation_fold.fold.clone()]);
     let test_evaluator = SmartsEvaluator::new(vec![test_fold.fold.clone()]);
     let task = EvolutionTask::new(task_name.clone(), vec![train_fold.fold]);
-    let mut last_printed_best = None;
-
     let result = evolve_task_with_progress(
         &task,
         evolution_config,
         seed_corpus,
         config.leaderboard_size,
         |progress_update| {
-            update_progress(
-                task_context.progress,
-                &task_name,
-                &mut last_printed_best,
-                &progress_update,
-            );
+            update_progress(task_context.progress, &task_name, &progress_update);
         },
     )?;
 
@@ -592,21 +625,29 @@ fn total_task_count(config: &ExperimentConfig, vocabulary: &Vocabulary) -> usize
         .sum()
 }
 
-fn terminal_progress_draw_target(refresh_rate: u8) -> Option<ProgressDrawTarget> {
-    if std::io::stderr().is_terminal() {
-        return Some(ProgressDrawTarget::stderr_with_hz(refresh_rate));
-    }
-
-    if std::io::stdout().is_terminal() {
-        return Some(ProgressDrawTarget::stdout_with_hz(refresh_rate));
-    }
-
-    None
-}
-
 fn overall_progress_style() -> ProgressStyle {
     let style = match ProgressStyle::with_template(
         "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} labels | {msg}",
+    ) {
+        Ok(style) => style,
+        Err(_) => ProgressStyle::default_bar(),
+    };
+    style.progress_chars("=> ")
+}
+
+fn input_overall_progress_style() -> ProgressStyle {
+    let style = match ProgressStyle::with_template(
+        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} inputs | {msg}",
+    ) {
+        Ok(style) => style,
+        Err(_) => ProgressStyle::default_bar(),
+    };
+    style.progress_chars("=> ")
+}
+
+fn input_split_progress_style() -> ProgressStyle {
+    let style = match ProgressStyle::with_template(
+        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.magenta/blue}] {pos}/{len} rows | {msg}",
     ) {
         Ok(style) => style,
         Err(_) => ProgressStyle::default_bar(),
@@ -627,44 +668,22 @@ fn task_progress_style() -> ProgressStyle {
 fn update_progress(
     progress_ui: &ExperimentProgress,
     task_name: &str,
-    last_printed_best: &mut Option<(String, f64)>,
     progress: &EvolutionProgress,
 ) {
     let best = progress.best();
-    if progress_ui.visible {
-        let smarts = truncate_progress_message(best.smarts(), 48);
-        progress_ui
-            .task_bar
-            .set_length(progress.generation_limit().max(1));
-        progress_ui.task_bar.set_position(progress.generation());
-        progress_ui.task_bar.set_message(format!(
-            "{task_name} | status={:?} | best={:.4} | complexity={} | smarts={smarts}",
-            progress.status(),
-            best.mcc(),
-            best.complexity(),
-        ));
-        if progress.status() != EvolutionStatus::Running {
-            progress_ui.task_bar.tick();
-        }
-        return;
-    }
-
-    let should_print = last_printed_best
-        .as_ref()
-        .is_none_or(|(smarts, mcc)| smarts != best.smarts() || (mcc - best.mcc()).abs() > 1e-9)
-        || progress.status() != EvolutionStatus::Running;
-
-    if should_print {
-        eprintln!(
-            "[evolve] {task_name} | generation={}/{} | status={:?} | best={:.4} | complexity={} | smarts={}",
-            progress.generation(),
-            progress.generation_limit(),
-            progress.status(),
-            best.mcc(),
-            best.complexity(),
-            best.smarts()
-        );
-        *last_printed_best = Some((best.smarts().to_owned(), best.mcc()));
+    let smarts = truncate_progress_message(best.smarts(), 48);
+    progress_ui
+        .task_bar
+        .set_length(progress.generation_limit().max(1));
+    progress_ui.task_bar.set_position(progress.generation());
+    progress_ui.task_bar.set_message(format!(
+        "{task_name} | status={:?} | best={:.4} | complexity={} | smarts={smarts}",
+        progress.status(),
+        best.mcc(),
+        best.complexity(),
+    ));
+    if progress.status() != EvolutionStatus::Running {
+        progress_ui.task_bar.tick();
     }
 }
 
@@ -1192,7 +1211,6 @@ mod tests {
             unreachable!()
         };
         let progress = ExperimentProgress {
-            visible: false,
             overall_bar: ProgressBar::hidden(),
             task_bar: ProgressBar::hidden(),
         };
@@ -1237,7 +1255,6 @@ mod tests {
             unreachable!()
         };
         let progress = ExperimentProgress {
-            visible: false,
             overall_bar: ProgressBar::hidden(),
             task_bar: ProgressBar::hidden(),
         };

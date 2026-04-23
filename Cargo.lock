@@ -1259,6 +1259,7 @@ dependencies = [
  "clap",
  "indicatif",
  "parquet",
+ "rayon",
  "serde",
  "serde_json",
  "smarts-evolution",
