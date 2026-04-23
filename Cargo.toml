@@ -2,7 +2,7 @@
 name = "npc-smarts"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.86"
+rust-version = "1.88"
 license = "MIT"
 description = "End-to-end NPC SMARTS evolution over the published distilled teacher splits."
 repository = "https://github.com/earth-metabolome-initiative/npc-smarts"
