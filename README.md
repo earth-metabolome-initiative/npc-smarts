@@ -13,5 +13,6 @@
 RUSTFLAGS="-C target-cpu=native" cargo run --release
 ```
 
-By default, each train/validation/test task set keeps all positives and samples
-up to 512 negatives per NPC class. Override with `--max-negatives-per-npc-class`.
+By default, each train/validation/test task set samples up to 512 positives and
+512 negatives per NPC class. Override with `--max-positives-per-npc-class` and
+`--max-negatives-per-npc-class`.

@@ -76,6 +76,8 @@ pub struct ExperimentConfig {
     #[arg(long, default_value_t = 1)]
     pub min_test_positives: usize,
     #[arg(long, default_value_t = 512)]
+    pub max_positives_per_npc_class: usize,
+    #[arg(long, default_value_t = 512)]
     pub max_negatives_per_npc_class: usize,
     #[arg(long, default_value_t = 32)]
     pub leaderboard_size: usize,
@@ -357,6 +359,12 @@ struct TaskRunContext<'a> {
     inputs: &'a LoadedInputs,
 }
 
+struct TaskSplitCounts {
+    train: SplitCounts,
+    validation: SplitCounts,
+    test: SplitCounts,
+}
+
 /// Run the full end-to-end experiment over the published distillation splits.
 ///
 /// # Errors
@@ -486,22 +494,17 @@ fn run_label_task(
         inputs.test.len(),
     );
 
-    let train_counts =
-        sampled_counts_from_split(task_context, &task_name, &inputs.train, head, label_id);
-    let validation_counts =
-        sampled_counts_from_split(task_context, &task_name, &inputs.validation, head, label_id);
-    let test_counts =
-        sampled_counts_from_split(task_context, &task_name, &inputs.test, head, label_id);
+    let counts = sampled_counts_for_task(task_context, &task_name, head, label_id);
 
-    if let Some(reason) = skip_reason(config, &train_counts, &validation_counts, &test_counts) {
+    if let Some(reason) = skip_reason(config, &counts.train, &counts.validation, &counts.test) {
         let skipped = SkippedTaskReport {
             head,
             label_id,
             label_name: label_name.to_owned(),
             reason,
-            train_counts,
-            validation_counts,
-            test_counts,
+            train_counts: counts.train,
+            validation_counts: counts.validation,
+            test_counts: counts.test,
         };
         progress.log_skip(&task_name, &skipped.reason);
         return Ok(TaskOutcome::Skipped(skipped));
@@ -510,9 +513,10 @@ fn run_label_task(
     let train_fold = inputs.train.build_sampled_fold_with_progress(
         head,
         label_id,
+        config.max_positives_per_npc_class,
         config.max_negatives_per_npc_class,
         &progress.task_bar,
-    );
+    )?;
     let result = evolve_fold_with_progress(
         &task_name,
         train_fold.fold,
@@ -522,29 +526,14 @@ fn run_label_task(
         task_context.progress,
     )?;
 
-    let validation_evaluator = {
-        let validation_fold = inputs.validation.build_sampled_fold_with_progress(
-            head,
-            label_id,
-            config.max_negatives_per_npc_class,
-            &progress.task_bar,
-        );
-        SmartsEvaluator::new(vec![validation_fold.fold])
-    };
-    let test_evaluator = {
-        let test_fold = inputs.test.build_sampled_fold_with_progress(
-            head,
-            label_id,
-            config.max_negatives_per_npc_class,
-            &progress.task_bar,
-        );
-        SmartsEvaluator::new(vec![test_fold.fold])
-    };
+    let (validation_evaluator, test_evaluator) =
+        build_holdout_evaluators(task_context, head, label_id)?;
     let candidates = evaluate_candidates(
         &task_name,
         result.leaders(),
         &validation_evaluator,
         &test_evaluator,
+        task_context.progress,
     )?;
     let selected = select_candidate(
         config.selection_strategy,
@@ -562,9 +551,9 @@ fn run_label_task(
         label_name: label_name.to_owned(),
         selection_strategy: config.selection_strategy,
         generations: result.generations(),
-        train_counts,
-        validation_counts,
-        test_counts,
+        train_counts: counts.train,
+        validation_counts: counts.validation,
+        test_counts: counts.test,
         train_best_smarts: result.best_smarts().to_owned(),
         train_best_mcc: result.best_mcc(),
         selected_smarts: selected.smarts.clone(),
@@ -577,6 +566,26 @@ fn run_label_task(
     progress.log_done(&report);
 
     Ok(TaskOutcome::Completed(report))
+}
+
+fn sampled_counts_for_task(
+    task_context: &TaskRunContext<'_>,
+    task_name: &str,
+    head: LabelHead,
+    label_id: u16,
+) -> TaskSplitCounts {
+    let inputs = task_context.inputs;
+    TaskSplitCounts {
+        train: sampled_counts_from_split(task_context, task_name, &inputs.train, head, label_id),
+        validation: sampled_counts_from_split(
+            task_context,
+            task_name,
+            &inputs.validation,
+            head,
+            label_id,
+        ),
+        test: sampled_counts_from_split(task_context, task_name, &inputs.test, head, label_id),
+    }
 }
 
 fn sampled_counts_from_split(
@@ -598,10 +607,41 @@ fn sampled_counts_from_split(
     let counts = split.sampled_counts_with_progress(
         head,
         label_id,
+        task_context.config.max_positives_per_npc_class,
         task_context.config.max_negatives_per_npc_class,
         &task_context.progress.task_bar,
     );
     counts_from_selection_counts(counts)
+}
+
+fn build_holdout_evaluators(
+    task_context: &TaskRunContext<'_>,
+    head: LabelHead,
+    label_id: u16,
+) -> Result<(SmartsEvaluator, SmartsEvaluator), ExperimentError> {
+    let config = task_context.config;
+    let progress = &task_context.progress.task_bar;
+    let validation_fold = task_context
+        .inputs
+        .validation
+        .build_sampled_fold_with_progress(
+            head,
+            label_id,
+            config.max_positives_per_npc_class,
+            config.max_negatives_per_npc_class,
+            progress,
+        )?;
+    let test_fold = task_context.inputs.test.build_sampled_fold_with_progress(
+        head,
+        label_id,
+        config.max_positives_per_npc_class,
+        config.max_negatives_per_npc_class,
+        progress,
+    )?;
+    Ok((
+        SmartsEvaluator::new(vec![validation_fold.fold]),
+        SmartsEvaluator::new(vec![test_fold.fold]),
+    ))
 }
 
 fn evolve_fold_with_progress(
@@ -621,9 +661,24 @@ fn evolve_fold_with_progress(
     let mut session =
         EvolutionSession::new(&task, evolution_config, seed_corpus, leaderboard_size)?;
     drop(task);
+    let generation_limit = evolution_config.generation_limit().max(1);
+    let mut next_generation = 1;
 
-    while let Some(progress_update) = session.step() {
+    while next_generation <= generation_limit {
+        progress.task_bar.set_length(generation_limit);
+        progress
+            .task_bar
+            .set_position(next_generation.saturating_sub(1));
+        progress.task_bar.set_message(format!(
+            "{task_name} | evaluating generation {next_generation}/{generation_limit}"
+        ));
+        progress.task_bar.tick();
+
+        let Some(progress_update) = session.step() else {
+            break;
+        };
         update_progress(progress, task_name, &progress_update);
+        next_generation = progress_update.generation().saturating_add(1);
         if session.is_finished() {
             return session.take_result().ok_or_else(|| {
                 ExperimentError::Evolution(EvolutionError::InvalidConfig(
@@ -797,11 +852,37 @@ fn evaluate_candidates(
     leaders: &[RankedSmarts],
     validation_evaluator: &SmartsEvaluator,
     test_evaluator: &SmartsEvaluator,
+    progress: &ExperimentProgress,
 ) -> Result<Vec<CandidateScore>, ExperimentError> {
     let mut candidates = Vec::with_capacity(leaders.len());
+    let total_steps = leaders.len().saturating_mul(2);
+    progress.set_task_phase(
+        task_id,
+        total_steps,
+        format!("{task_id} | scoring {} leader SMARTS", leaders.len()),
+    );
+    let mut completed_steps = 0usize;
     for leader in leaders {
+        progress.task_bar.set_message(format!(
+            "{task_id} | scoring validation | {}/{}",
+            completed_steps,
+            total_steps.max(1)
+        ));
         let validation_mcc = evaluate_smarts(task_id, leader.smarts(), validation_evaluator)?;
+        completed_steps += 1;
+        progress
+            .task_bar
+            .set_position(usize_to_u64(completed_steps));
+        progress.task_bar.set_message(format!(
+            "{task_id} | scoring test | {}/{}",
+            completed_steps,
+            total_steps.max(1)
+        ));
         let test_mcc = evaluate_smarts(task_id, leader.smarts(), test_evaluator)?;
+        completed_steps += 1;
+        progress
+            .task_bar
+            .set_position(usize_to_u64(completed_steps));
         candidates.push(CandidateScore {
             smarts: leader.smarts().to_owned(),
             complexity: leader.complexity(),
@@ -917,6 +998,7 @@ mod tests {
             min_train_positives: 1,
             min_validation_positives: 1,
             min_test_positives: 1,
+            max_positives_per_npc_class: 512,
             max_negatives_per_npc_class: 512,
             leaderboard_size: 32,
             selection_strategy: SelectionStrategy::ValidationBestLeader,

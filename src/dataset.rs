@@ -73,7 +73,6 @@ impl Vocabulary {
 pub struct SplitRow {
     pub cid: i64,
     pub smiles: String,
-    pub target: PreparedTarget,
     pub pathway_ids: Vec<u16>,
     pub superclass_ids: Vec<u16>,
     pub class_ids: Vec<u16>,
@@ -97,13 +96,13 @@ pub struct DatasetSplit {
 }
 
 impl DatasetSplit {
-    /// Load one published parquet split and prepare every SMILES for matching.
+    /// Load one published parquet split without preparing molecule match data.
     ///
     /// # Errors
     ///
     /// Returns an error if the parquet file cannot be read, if required columns
     /// are missing, if labels are malformed, or if any SMILES row cannot be
-    /// parsed into a prepared target.
+    /// parsed into the in-memory row representation.
     pub fn load(path: &Path, name: impl Into<String>) -> Result<Self, ExperimentError> {
         let progress_bar = ProgressBar::hidden();
         Self::load_with_progress(path, name, &progress_bar)
@@ -115,7 +114,7 @@ impl DatasetSplit {
     ///
     /// Returns an error if the parquet file cannot be read, if required columns
     /// are missing, if labels are malformed, or if any SMILES row cannot be
-    /// parsed into a prepared target.
+    /// parsed into the in-memory row representation.
     pub fn load_with_progress(
         path: &Path,
         name: impl Into<String>,
@@ -139,7 +138,7 @@ impl DatasetSplit {
         for batch in reader {
             let batch =
                 batch.map_err(|error| ExperimentError::InvalidDataset(error.to_string()))?;
-            progress_bar.set_message(format!("{name} | preparing SMARTS targets"));
+            progress_bar.set_message(format!("{name} | loading raw rows"));
             let prepared_rows = prepare_batch_rows(&batch, &name)?;
             progress_bar.inc(usize_to_u64(prepared_rows.len()));
             rows.extend(prepared_rows);
@@ -172,20 +171,32 @@ impl DatasetSplit {
         self.rows.is_empty()
     }
 
-    #[must_use]
-    pub fn build_fold(&self, head: LabelHead, label_id: u16) -> LabeledFold {
+    /// Build an unsampled labeled evaluation set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any selected SMILES cannot be parsed.
+    pub fn build_fold(
+        &self,
+        head: LabelHead,
+        label_id: u16,
+    ) -> Result<LabeledFold, ExperimentError> {
         let progress_bar = ProgressBar::hidden();
         self.build_fold_with_progress(head, label_id, &progress_bar)
     }
 
-    #[must_use]
+    /// Build an unsampled labeled evaluation set with progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any selected SMILES cannot be parsed.
     pub fn build_fold_with_progress(
         &self,
         head: LabelHead,
         label_id: u16,
         progress_bar: &ProgressBar,
-    ) -> LabeledFold {
-        self.build_sampled_fold_with_progress(head, label_id, usize::MAX, progress_bar)
+    ) -> Result<LabeledFold, ExperimentError> {
+        self.build_sampled_fold_with_progress(head, label_id, usize::MAX, usize::MAX, progress_bar)
     }
 
     #[must_use]
@@ -193,34 +204,51 @@ impl DatasetSplit {
         &self,
         head: LabelHead,
         label_id: u16,
+        max_positives_per_class: usize,
         max_negatives_per_class: usize,
         progress_bar: &ProgressBar,
     ) -> FoldSelectionCounts {
-        let selection =
-            self.select_sample_indices(head, label_id, max_negatives_per_class, progress_bar);
+        let selection = self.select_sample_indices(
+            head,
+            label_id,
+            max_positives_per_class,
+            max_negatives_per_class,
+            progress_bar,
+        );
         FoldSelectionCounts {
             positive_count: selection.positive_count,
             negative_count: selection.negative_count,
         }
     }
 
-    #[must_use]
+    /// Build a sampled labeled evaluation set with progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any selected SMILES cannot be parsed.
     pub fn build_sampled_fold_with_progress(
         &self,
         head: LabelHead,
         label_id: u16,
+        max_positives_per_class: usize,
         max_negatives_per_class: usize,
         progress_bar: &ProgressBar,
-    ) -> LabeledFold {
+    ) -> Result<LabeledFold, ExperimentError> {
         let SampleSelection {
             indices,
             positive_count,
             negative_count,
-        } = self.select_sample_indices(head, label_id, max_negatives_per_class, progress_bar);
+        } = self.select_sample_indices(
+            head,
+            label_id,
+            max_positives_per_class,
+            max_negatives_per_class,
+            progress_bar,
+        );
         progress_bar.set_length(usize_to_u64(indices.len()));
         progress_bar.set_position(0);
         progress_bar.set_message(format!(
-            "{} | cloning {} selected {}:{label_id} targets",
+            "{} | preparing {} selected {}:{label_id} targets",
             self.name,
             indices.len(),
             head.as_str()
@@ -232,12 +260,7 @@ impl DatasetSplit {
             .par_iter()
             .map(|&row_index| {
                 let row = &self.rows[row_index];
-                let is_positive = row.labels(head).contains(&label_id);
-                let sample = if is_positive {
-                    FoldSample::positive(row.target.clone())
-                } else {
-                    FoldSample::negative(row.target.clone())
-                };
+                let sample = prepare_fold_sample(row, &self.name, head, label_id);
                 let completed = completed_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                 if completed.is_multiple_of(FOLD_PROGRESS_GRANULARITY)
                     || completed == selected_count
@@ -246,7 +269,7 @@ impl DatasetSplit {
                 }
                 sample
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         drop(indices);
 
         progress_bar.set_message(format!(
@@ -256,17 +279,18 @@ impl DatasetSplit {
             head.as_str()
         ));
         progress_bar.tick();
-        LabeledFold {
+        Ok(LabeledFold {
             fold: FoldData::new(samples),
             positive_count,
             negative_count,
-        }
+        })
     }
 
     fn select_sample_indices(
         &self,
         head: LabelHead,
         label_id: u16,
+        max_positives_per_class: usize,
         max_negatives_per_class: usize,
         progress_bar: &ProgressBar,
     ) -> SampleSelection {
@@ -274,22 +298,32 @@ impl DatasetSplit {
         progress_bar.set_length(usize_to_u64(row_count));
         progress_bar.set_position(0);
         progress_bar.set_message(format!(
-            "{} | selecting {}:{label_id} evaluation rows | max_negatives_per_class={max_negatives_per_class}",
+            "{} | selecting {}:{label_id} evaluation rows | max_positives_per_class={max_positives_per_class} max_negatives_per_class={max_negatives_per_class}",
             self.name,
             head.as_str()
         ));
 
-        let mut positive_indices = Vec::new();
+        let mut all_positive_indices = Vec::new();
         let mut all_negative_indices = Vec::new();
+        let mut positive_buckets: HashMap<Option<u16>, BinaryHeap<RankedIndex>> = HashMap::new();
         let mut negative_buckets: HashMap<Option<u16>, BinaryHeap<RankedIndex>> = HashMap::new();
 
         for (row_index, row) in self.rows.iter().enumerate() {
             if row.labels(head).contains(&label_id) {
-                positive_indices.push(row_index);
+                if max_positives_per_class == usize::MAX {
+                    all_positive_indices.push(row_index);
+                } else if max_positives_per_class > 0 {
+                    push_sample_candidates(
+                        &mut positive_buckets,
+                        row,
+                        row_index,
+                        max_positives_per_class,
+                    );
+                }
             } else if max_negatives_per_class == usize::MAX {
                 all_negative_indices.push(row_index);
             } else if max_negatives_per_class > 0 {
-                push_negative_candidates(
+                push_sample_candidates(
                     &mut negative_buckets,
                     row,
                     row_index,
@@ -303,10 +337,18 @@ impl DatasetSplit {
             }
         }
 
+        let mut positive_indices = if max_positives_per_class == usize::MAX {
+            all_positive_indices
+        } else {
+            sampled_indices(positive_buckets)
+        };
+        positive_indices.sort_unstable();
+        positive_indices.dedup();
+
         let mut negative_indices = if max_negatives_per_class == usize::MAX {
             all_negative_indices
         } else {
-            sampled_negative_indices(negative_buckets)
+            sampled_indices(negative_buckets)
         };
         negative_indices.sort_unstable();
         negative_indices.dedup();
@@ -363,46 +405,46 @@ impl PartialOrd for RankedIndex {
     }
 }
 
-fn push_negative_candidates(
+fn push_sample_candidates(
     buckets: &mut HashMap<Option<u16>, BinaryHeap<RankedIndex>>,
     row: &SplitRow,
     row_index: usize,
-    max_negatives_per_class: usize,
+    max_per_class: usize,
 ) {
     if row.class_ids.is_empty() {
-        push_negative_candidate(
+        push_sample_candidate(
             buckets,
             None,
             RankedIndex {
                 score: sample_score(row, row_index, None),
                 index: row_index,
             },
-            max_negatives_per_class,
+            max_per_class,
         );
         return;
     }
 
     for &class_id in &row.class_ids {
-        push_negative_candidate(
+        push_sample_candidate(
             buckets,
             Some(class_id),
             RankedIndex {
                 score: sample_score(row, row_index, Some(class_id)),
                 index: row_index,
             },
-            max_negatives_per_class,
+            max_per_class,
         );
     }
 }
 
-fn push_negative_candidate(
+fn push_sample_candidate(
     buckets: &mut HashMap<Option<u16>, BinaryHeap<RankedIndex>>,
     class_id: Option<u16>,
     candidate: RankedIndex,
-    max_negatives_per_class: usize,
+    max_per_class: usize,
 ) {
     let bucket = buckets.entry(class_id).or_default();
-    if bucket.len() < max_negatives_per_class {
+    if bucket.len() < max_per_class {
         bucket.push(candidate);
     } else if bucket.peek().is_some_and(|worst| candidate < *worst) {
         bucket.pop();
@@ -410,7 +452,7 @@ fn push_negative_candidate(
     }
 }
 
-fn sampled_negative_indices(buckets: HashMap<Option<u16>, BinaryHeap<RankedIndex>>) -> Vec<usize> {
+fn sampled_indices(buckets: HashMap<Option<u16>, BinaryHeap<RankedIndex>>) -> Vec<usize> {
     buckets
         .into_values()
         .flat_map(BinaryHeap::into_iter)
@@ -514,13 +556,10 @@ fn prepare_batch_rows(batch: &RecordBatch, split: &str) -> Result<Vec<SplitRow>,
         })
         .collect::<Result<Vec<_>, ExperimentError>>()?;
 
-    raw_rows
-        .into_par_iter()
-        .map(|row| prepare_raw_row(row, split))
-        .collect()
+    Ok(raw_rows.into_iter().map(prepare_raw_row).collect())
 }
 
-fn prepare_raw_row(row: RawSplitRow, split: &str) -> Result<SplitRow, ExperimentError> {
+fn prepare_raw_row(row: RawSplitRow) -> SplitRow {
     let RawSplitRow {
         cid,
         smiles,
@@ -528,22 +567,36 @@ fn prepare_raw_row(row: RawSplitRow, split: &str) -> Result<SplitRow, Experiment
         superclass_ids,
         class_ids,
     } = row;
-    let parsed = smiles
-        .parse::<Smiles>()
-        .map_err(|error| ExperimentError::InvalidSmiles {
-            split: split.to_owned(),
-            cid,
-            smiles: smiles.clone(),
-            message: error.to_string(),
-        })?;
-    Ok(SplitRow {
+    SplitRow {
         cid,
         smiles,
-        target: PreparedTarget::new(parsed),
         pathway_ids,
         superclass_ids,
         class_ids,
-    })
+    }
+}
+
+fn prepare_fold_sample(
+    row: &SplitRow,
+    split: &str,
+    head: LabelHead,
+    label_id: u16,
+) -> Result<FoldSample, ExperimentError> {
+    let parsed = row
+        .smiles
+        .parse::<Smiles>()
+        .map_err(|error| ExperimentError::InvalidSmiles {
+            split: split.to_owned(),
+            cid: row.cid,
+            smiles: row.smiles.clone(),
+            message: error.to_string(),
+        })?;
+    let target = PreparedTarget::new(parsed);
+    if row.labels(head).contains(&label_id) {
+        Ok(FoldSample::positive(target))
+    } else {
+        Ok(FoldSample::negative(target))
+    }
 }
 
 fn usize_to_u64(value: usize) -> u64 {
@@ -662,6 +715,8 @@ mod tests {
         assert!(loaded.rows()[1].labels(LabelHead::Pathway).is_empty());
 
         let fold = loaded.build_fold(LabelHead::Class, 2);
+        assert!(fold.is_ok());
+        let Ok(fold) = fold else { unreachable!() };
         assert_eq!(fold.positive_count, 2);
         assert_eq!(fold.negative_count, 1);
         assert_eq!(fold.fold.len(), 3);
@@ -670,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn sampled_fold_keeps_all_positives_and_caps_negatives_by_class() {
+    fn sampled_fold_caps_positives_and_negatives_by_class() {
         let temp_dir = std::env::temp_dir().join(format!(
             "npc-smarts-dataset-sampling-test-{}",
             std::process::id()
@@ -698,19 +753,22 @@ mod tests {
         assert!(loaded.is_ok());
         let Ok(loaded) = loaded else { unreachable!() };
         let progress_bar = ProgressBar::hidden();
-        let counts = loaded.sampled_counts_with_progress(LabelHead::Class, 0, 1, &progress_bar);
+        let counts = loaded.sampled_counts_with_progress(LabelHead::Class, 0, 1, 1, &progress_bar);
         assert_eq!(
             counts,
             FoldSelectionCounts {
-                positive_count: 2,
+                positive_count: 1,
                 negative_count: 3,
             }
         );
 
-        let fold = loaded.build_sampled_fold_with_progress(LabelHead::Class, 0, 1, &progress_bar);
-        assert_eq!(fold.positive_count, 2);
+        let fold =
+            loaded.build_sampled_fold_with_progress(LabelHead::Class, 0, 1, 1, &progress_bar);
+        assert!(fold.is_ok());
+        let Ok(fold) = fold else { unreachable!() };
+        assert_eq!(fold.positive_count, 1);
         assert_eq!(fold.negative_count, 3);
-        assert_eq!(fold.fold.len(), 5);
+        assert_eq!(fold.fold.len(), 4);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
