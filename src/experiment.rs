@@ -69,7 +69,7 @@ pub struct ExperimentConfig {
     pub output_dir: PathBuf,
     #[arg(long)]
     pub max_labels_per_head: Option<usize>,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 50)]
     pub min_train_positives: usize,
     #[arg(long, default_value_t = 1)]
     pub min_validation_positives: usize,
@@ -486,7 +486,8 @@ fn run_all_tasks(
 ) -> Result<Vec<TaskOutcome>, ExperimentError> {
     let evolution_config = config.evolution_config()?;
     let seed_corpus = SeedCorpus::builtin();
-    let progress = ExperimentProgress::new(total_task_count(config, &inputs.vocabulary));
+    let task_plan = sorted_task_plan(config, inputs)?;
+    let progress = ExperimentProgress::new(task_plan.len());
     let task_context = TaskRunContext {
         config,
         evolution_config: &evolution_config,
@@ -494,7 +495,6 @@ fn run_all_tasks(
         progress: &progress,
         inputs,
     };
-    let task_plan = sorted_task_plan(&task_context)?;
     let mut outcomes = Vec::new();
 
     for task in &task_plan {
@@ -602,27 +602,18 @@ fn run_label_task(
 }
 
 fn sorted_task_plan(
-    task_context: &TaskRunContext<'_>,
+    config: &ExperimentConfig,
+    inputs: &LoadedInputs,
 ) -> Result<Vec<PlannedLabelTask>, ExperimentError> {
-    let config = task_context.config;
-    let vocabulary = &task_context.inputs.vocabulary;
+    let vocabulary = &inputs.vocabulary;
     let mut tasks = Vec::with_capacity(total_task_count(config, vocabulary));
 
     for head in LabelHead::ALL {
         let labels = vocabulary.labels(head);
         let max_labels = config.max_labels_per_head.unwrap_or(labels.len());
-        let train_positives = task_context
-            .inputs
-            .train
-            .label_positive_counts(head, labels.len());
-        let validation_positives = task_context
-            .inputs
-            .validation
-            .label_positive_counts(head, labels.len());
-        let test_positives = task_context
-            .inputs
-            .test
-            .label_positive_counts(head, labels.len());
+        let train_positives = inputs.train.label_positive_counts(head, labels.len());
+        let validation_positives = inputs.validation.label_positive_counts(head, labels.len());
+        let test_positives = inputs.test.label_positive_counts(head, labels.len());
 
         for (label_index, label_name) in labels.iter().enumerate().take(max_labels) {
             let label_id = u16::try_from(label_index).map_err(|error| {
@@ -632,6 +623,9 @@ fn sorted_task_plan(
                 ))
             })?;
             let train_count = train_positives[label_index];
+            if train_count < config.min_train_positives {
+                continue;
+            }
             tasks.push(PlannedLabelTask {
                 ordinal: tasks.len(),
                 head,
@@ -1027,7 +1021,7 @@ mod tests {
             data_dir: PathBuf::from("data"),
             output_dir: PathBuf::from("artifacts"),
             max_labels_per_head: None,
-            min_train_positives: 1,
+            min_train_positives: 50,
             min_validation_positives: 1,
             min_test_positives: 1,
             max_positives_per_npc_class: 512,
@@ -1249,6 +1243,67 @@ mod tests {
     }
 
     #[test]
+    fn task_plan_filters_labels_with_too_few_training_examples() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("npc-smarts-task-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let create_dir_result = std::fs::create_dir_all(&temp_dir);
+        assert!(create_dir_result.is_ok());
+
+        let vocabulary_path = temp_dir.join("vocabulary.json");
+        let write_vocabulary_result = std::fs::write(
+            &vocabulary_path,
+            "{\n  \"pathway\": [],\n  \"superclass\": [],\n  \"class\": [\"rare\", \"kept\"]\n}\n",
+        );
+        assert!(write_vocabulary_result.is_ok());
+        write_split_parquet(
+            &temp_dir.join("train.parquet"),
+            &[
+                ("CN", 1, vec![0]),
+                ("CCN", 2, vec![1]),
+                ("N", 3, vec![1]),
+                ("CCO", 4, vec![]),
+            ],
+        );
+        write_split_parquet(
+            &temp_dir.join("validation.parquet"),
+            &[("CN", 5, vec![0]), ("CCN", 6, vec![1])],
+        );
+        write_split_parquet(
+            &temp_dir.join("test.parquet"),
+            &[("CN", 7, vec![0]), ("CCN", 8, vec![1])],
+        );
+
+        let vocabulary = Vocabulary::load(&vocabulary_path);
+        assert!(vocabulary.is_ok());
+        let train = DatasetSplit::load(&temp_dir.join("train.parquet"), "train");
+        assert!(train.is_ok());
+        let validation = DatasetSplit::load(&temp_dir.join("validation.parquet"), "validation");
+        assert!(validation.is_ok());
+        let test = DatasetSplit::load(&temp_dir.join("test.parquet"), "test");
+        assert!(test.is_ok());
+        let inputs = LoadedInputs {
+            downloaded_files: Vec::new(),
+            vocabulary: vocabulary.unwrap_or_else(|_| unreachable!()),
+            train: train.unwrap_or_else(|_| unreachable!()),
+            validation: validation.unwrap_or_else(|_| unreachable!()),
+            test: test.unwrap_or_else(|_| unreachable!()),
+        };
+        let mut config = baseline_config();
+        config.min_train_positives = 2;
+
+        let task_plan = sorted_task_plan(&config, &inputs);
+        assert!(task_plan.is_ok());
+        let Ok(task_plan) = task_plan else {
+            unreachable!()
+        };
+        assert_eq!(task_plan.len(), 1);
+        assert_eq!(task_plan[0].label_name, "kept");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn task_plan_sort_starts_with_fewest_training_examples() {
         let mut tasks = vec![
             planned_task(0, 0, "many", 10, 1, 1),
@@ -1434,7 +1489,8 @@ mod tests {
 
     #[test]
     fn skip_reason_reports_missing_negatives() {
-        let config = baseline_config();
+        let mut config = baseline_config();
+        config.min_train_positives = 1;
         let reason = skip_reason(
             &config,
             &SplitCounts {
@@ -1519,6 +1575,7 @@ mod tests {
 
         let inputs = load_inputs_for_class_task(&temp_dir);
         let mut config = baseline_config();
+        config.min_train_positives = 1;
         config.population_size = 16;
         config.generation_limit = 6;
         config.stagnation_limit = 3;

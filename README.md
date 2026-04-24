@@ -17,6 +17,9 @@ By default, each train/validation/test task set samples up to 512 positives and
 512 negatives per NPC class. Override with `--max-positives-per-npc-class` and
 `--max-negatives-per-npc-class`.
 
+Labels with fewer than 50 training examples are filtered out by default. Override
+with `--min-train-positives`.
+
 Slow SMARTS warnings are logged by default after 30 seconds. The default
 evaluation complexity cap is 1536, with a hard upstream SMARTS genome ceiling
 of 4096. Use `--slow-evaluation-log-threshold-millis`,
