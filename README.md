@@ -17,8 +17,9 @@ By default, each train/validation/test task set samples up to 512 positives and
 512 negatives per NPC class. Override with `--max-positives-per-npc-class` and
 `--max-negatives-per-npc-class`.
 
-Slow SMARTS warnings are logged by default after 30 seconds. Use
-`--slow-evaluation-log-threshold-millis`, `--max-evaluation-smarts-complexity`,
-and `--max-evaluation-smarts-len` to tighten evaluation guardrails. The run
-writes these warnings to `artifacts/slow-smarts.log` without colliding with the
-progress bars.
+Slow SMARTS warnings are logged by default after 30 seconds. The default
+evaluation complexity cap is 1536, with a hard upstream SMARTS genome ceiling
+of 4096. Use `--slow-evaluation-log-threshold-millis`,
+`--max-evaluation-smarts-complexity`, and `--max-evaluation-smarts-len` to
+tighten evaluation guardrails. The run writes these warnings to
+`artifacts/slow-smarts.log` without colliding with the progress bars.

@@ -1275,6 +1275,7 @@ mod tests {
         assert_eq!(built.tournament_size(), 5);
         assert_eq!(built.elite_count(), 8);
         assert_eq!(built.fitness_cache_capacity(), 500_000);
+        assert_eq!(built.max_evaluation_smarts_complexity(), 1536);
         assert_eq!(
             built.slow_evaluation_log_threshold(),
             Some(Duration::from_secs(30))
