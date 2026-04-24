@@ -16,3 +16,7 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release
 By default, each train/validation/test task set samples up to 512 positives and
 512 negatives per NPC class. Override with `--max-positives-per-npc-class` and
 `--max-negatives-per-npc-class`.
+
+Slow SMARTS warnings are logged by default after 30 seconds. Use
+`--slow-evaluation-log-threshold-millis`, `--max-evaluation-smarts-complexity`,
+and `--max-evaluation-smarts-len` to tighten evaluation guardrails.

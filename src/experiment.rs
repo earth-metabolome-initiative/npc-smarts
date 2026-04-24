@@ -105,6 +105,14 @@ pub struct ExperimentConfig {
     pub rng_seed: Option<u64>,
     #[arg(long, default_value_t = 500_000)]
     pub fitness_cache_capacity: usize,
+    #[arg(long)]
+    pub max_evaluation_smarts_complexity: Option<usize>,
+    #[arg(long)]
+    pub max_evaluation_smarts_len: Option<usize>,
+    #[arg(long, default_value_t = 30_000)]
+    pub slow_evaluation_log_threshold_millis: u64,
+    #[arg(long)]
+    pub disable_slow_evaluation_logging: bool,
 }
 
 impl ExperimentConfig {
@@ -128,6 +136,19 @@ impl ExperimentConfig {
             .fitness_cache_capacity(self.fitness_cache_capacity);
         if let Some(seed) = self.rng_seed {
             builder = builder.rng_seed(seed);
+        }
+        if let Some(max_complexity) = self.max_evaluation_smarts_complexity {
+            builder = builder.max_evaluation_smarts_complexity(max_complexity);
+        }
+        if let Some(max_len) = self.max_evaluation_smarts_len {
+            builder = builder.max_evaluation_smarts_len(max_len);
+        }
+        if self.disable_slow_evaluation_logging || self.slow_evaluation_log_threshold_millis == 0 {
+            builder = builder.disable_slow_evaluation_logging();
+        } else {
+            builder = builder.slow_evaluation_log_threshold(Duration::from_millis(
+                self.slow_evaluation_log_threshold_millis,
+            ));
         }
 
         builder
@@ -955,6 +976,10 @@ mod tests {
             stagnation_limit: 120,
             rng_seed: None,
             fitness_cache_capacity: 500_000,
+            max_evaluation_smarts_complexity: None,
+            max_evaluation_smarts_len: None,
+            slow_evaluation_log_threshold_millis: 30_000,
+            disable_slow_evaluation_logging: false,
         }
     }
 
@@ -1119,10 +1144,44 @@ mod tests {
         assert_eq!(built.tournament_size(), 5);
         assert_eq!(built.elite_count(), 8);
         assert_eq!(built.fitness_cache_capacity(), 500_000);
+        assert_eq!(
+            built.slow_evaluation_log_threshold(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(built.max_evaluation_smarts_len(), None);
         assert!((built.mutation_rate() - 0.90).abs() < f64::EPSILON);
         assert!((built.crossover_rate() - 0.75).abs() < f64::EPSILON);
         assert!((built.selection_ratio() - 0.35).abs() < f64::EPSILON);
         assert!((built.random_immigrant_ratio() - 0.20).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn evolution_config_forwards_slow_smarts_controls() {
+        let mut config = baseline_config();
+        config.max_evaluation_smarts_complexity = Some(8);
+        config.max_evaluation_smarts_len = Some(96);
+        config.slow_evaluation_log_threshold_millis = 250;
+
+        let built = config.evolution_config();
+        assert!(built.is_ok());
+        let Ok(built) = built else { unreachable!() };
+        assert_eq!(built.max_evaluation_smarts_complexity(), 8);
+        assert_eq!(built.max_evaluation_smarts_len(), Some(96));
+        assert_eq!(
+            built.slow_evaluation_log_threshold(),
+            Some(Duration::from_millis(250))
+        );
+    }
+
+    #[test]
+    fn evolution_config_can_disable_slow_smarts_logging() {
+        let mut config = baseline_config();
+        config.disable_slow_evaluation_logging = true;
+
+        let built = config.evolution_config();
+        assert!(built.is_ok());
+        let Ok(built) = built else { unreachable!() };
+        assert_eq!(built.slow_evaluation_log_threshold(), None);
     }
 
     #[test]
