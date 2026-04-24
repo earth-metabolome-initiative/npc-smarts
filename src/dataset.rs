@@ -1,5 +1,8 @@
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use arrow_array::cast::{as_list_array, as_primitive_array, as_string_array};
 use arrow_array::types::Int64Type;
@@ -13,6 +16,8 @@ use smarts_rs::PreparedTarget;
 use smiles_parser::Smiles;
 
 use crate::experiment::ExperimentError;
+
+const FOLD_PROGRESS_GRANULARITY: usize = 8_192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -169,22 +174,150 @@ impl DatasetSplit {
 
     #[must_use]
     pub fn build_fold(&self, head: LabelHead, label_id: u16) -> LabeledFold {
-        let mut samples = Vec::with_capacity(self.rows.len());
-        let mut positive_count = 0usize;
-        for row in &self.rows {
-            let is_positive = row.labels(head).contains(&label_id);
-            positive_count += usize::from(is_positive);
-            let sample = if is_positive {
-                FoldSample::positive(row.target.clone())
-            } else {
-                FoldSample::negative(row.target.clone())
-            };
-            samples.push(sample);
-        }
+        let progress_bar = ProgressBar::hidden();
+        self.build_fold_with_progress(head, label_id, &progress_bar)
+    }
 
-        let negative_count = samples.len().saturating_sub(positive_count);
+    #[must_use]
+    pub fn build_fold_with_progress(
+        &self,
+        head: LabelHead,
+        label_id: u16,
+        progress_bar: &ProgressBar,
+    ) -> LabeledFold {
+        self.build_sampled_fold_with_progress(head, label_id, usize::MAX, progress_bar)
+    }
+
+    #[must_use]
+    pub fn sampled_counts_with_progress(
+        &self,
+        head: LabelHead,
+        label_id: u16,
+        max_negatives_per_class: usize,
+        progress_bar: &ProgressBar,
+    ) -> FoldSelectionCounts {
+        let selection =
+            self.select_sample_indices(head, label_id, max_negatives_per_class, progress_bar);
+        FoldSelectionCounts {
+            positive_count: selection.positive_count,
+            negative_count: selection.negative_count,
+        }
+    }
+
+    #[must_use]
+    pub fn build_sampled_fold_with_progress(
+        &self,
+        head: LabelHead,
+        label_id: u16,
+        max_negatives_per_class: usize,
+        progress_bar: &ProgressBar,
+    ) -> LabeledFold {
+        let SampleSelection {
+            indices,
+            positive_count,
+            negative_count,
+        } = self.select_sample_indices(head, label_id, max_negatives_per_class, progress_bar);
+        progress_bar.set_length(usize_to_u64(indices.len()));
+        progress_bar.set_position(0);
+        progress_bar.set_message(format!(
+            "{} | cloning {} selected {}:{label_id} targets",
+            self.name,
+            indices.len(),
+            head.as_str()
+        ));
+
+        let completed_count = AtomicUsize::new(0);
+        let selected_count = indices.len();
+        let samples = indices
+            .par_iter()
+            .map(|&row_index| {
+                let row = &self.rows[row_index];
+                let is_positive = row.labels(head).contains(&label_id);
+                let sample = if is_positive {
+                    FoldSample::positive(row.target.clone())
+                } else {
+                    FoldSample::negative(row.target.clone())
+                };
+                let completed = completed_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                if completed.is_multiple_of(FOLD_PROGRESS_GRANULARITY)
+                    || completed == selected_count
+                {
+                    progress_bar.set_position(usize_to_u64(completed));
+                }
+                sample
+            })
+            .collect::<Vec<_>>();
+        drop(indices);
+
+        progress_bar.set_message(format!(
+            "{} | indexing {} selected {}:{label_id} targets",
+            self.name,
+            samples.len(),
+            head.as_str()
+        ));
+        progress_bar.tick();
         LabeledFold {
             fold: FoldData::new(samples),
+            positive_count,
+            negative_count,
+        }
+    }
+
+    fn select_sample_indices(
+        &self,
+        head: LabelHead,
+        label_id: u16,
+        max_negatives_per_class: usize,
+        progress_bar: &ProgressBar,
+    ) -> SampleSelection {
+        let row_count = self.rows.len();
+        progress_bar.set_length(usize_to_u64(row_count));
+        progress_bar.set_position(0);
+        progress_bar.set_message(format!(
+            "{} | selecting {}:{label_id} evaluation rows | max_negatives_per_class={max_negatives_per_class}",
+            self.name,
+            head.as_str()
+        ));
+
+        let mut positive_indices = Vec::new();
+        let mut all_negative_indices = Vec::new();
+        let mut negative_buckets: HashMap<Option<u16>, BinaryHeap<RankedIndex>> = HashMap::new();
+
+        for (row_index, row) in self.rows.iter().enumerate() {
+            if row.labels(head).contains(&label_id) {
+                positive_indices.push(row_index);
+            } else if max_negatives_per_class == usize::MAX {
+                all_negative_indices.push(row_index);
+            } else if max_negatives_per_class > 0 {
+                push_negative_candidates(
+                    &mut negative_buckets,
+                    row,
+                    row_index,
+                    max_negatives_per_class,
+                );
+            }
+
+            let completed = row_index + 1;
+            if completed.is_multiple_of(FOLD_PROGRESS_GRANULARITY) || completed == row_count {
+                progress_bar.set_position(usize_to_u64(completed));
+            }
+        }
+
+        let mut negative_indices = if max_negatives_per_class == usize::MAX {
+            all_negative_indices
+        } else {
+            sampled_negative_indices(negative_buckets)
+        };
+        negative_indices.sort_unstable();
+        negative_indices.dedup();
+
+        let positive_count = positive_indices.len();
+        let negative_count = negative_indices.len();
+        positive_indices.extend(negative_indices);
+        positive_indices.sort_unstable();
+
+        SampleSelection {
+            indices: positive_indices,
             positive_count,
             negative_count,
         }
@@ -196,6 +329,107 @@ pub struct LabeledFold {
     pub fold: FoldData,
     pub positive_count: usize,
     pub negative_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldSelectionCounts {
+    pub positive_count: usize,
+    pub negative_count: usize,
+}
+
+struct SampleSelection {
+    indices: Vec<usize>,
+    positive_count: usize,
+    negative_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RankedIndex {
+    score: u64,
+    index: usize,
+}
+
+impl Ord for RankedIndex {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .cmp(&other.score)
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+impl PartialOrd for RankedIndex {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn push_negative_candidates(
+    buckets: &mut HashMap<Option<u16>, BinaryHeap<RankedIndex>>,
+    row: &SplitRow,
+    row_index: usize,
+    max_negatives_per_class: usize,
+) {
+    if row.class_ids.is_empty() {
+        push_negative_candidate(
+            buckets,
+            None,
+            RankedIndex {
+                score: sample_score(row, row_index, None),
+                index: row_index,
+            },
+            max_negatives_per_class,
+        );
+        return;
+    }
+
+    for &class_id in &row.class_ids {
+        push_negative_candidate(
+            buckets,
+            Some(class_id),
+            RankedIndex {
+                score: sample_score(row, row_index, Some(class_id)),
+                index: row_index,
+            },
+            max_negatives_per_class,
+        );
+    }
+}
+
+fn push_negative_candidate(
+    buckets: &mut HashMap<Option<u16>, BinaryHeap<RankedIndex>>,
+    class_id: Option<u16>,
+    candidate: RankedIndex,
+    max_negatives_per_class: usize,
+) {
+    let bucket = buckets.entry(class_id).or_default();
+    if bucket.len() < max_negatives_per_class {
+        bucket.push(candidate);
+    } else if bucket.peek().is_some_and(|worst| candidate < *worst) {
+        bucket.pop();
+        bucket.push(candidate);
+    }
+}
+
+fn sampled_negative_indices(buckets: HashMap<Option<u16>, BinaryHeap<RankedIndex>>) -> Vec<usize> {
+    buckets
+        .into_values()
+        .flat_map(BinaryHeap::into_iter)
+        .map(|candidate| candidate.index)
+        .collect()
+}
+
+fn sample_score(row: &SplitRow, row_index: usize, class_id: Option<u16>) -> u64 {
+    let cid_bits = u64::from_ne_bytes(row.cid.to_ne_bytes());
+    let row_bits = u64::try_from(row_index).unwrap_or(u64::MAX);
+    let class_bits = class_id.map_or(u64::MAX, u64::from);
+    mix64(cid_bits ^ row_bits.rotate_left(17) ^ class_bits.rotate_left(41))
+}
+
+fn mix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 fn column<'a>(
@@ -431,6 +665,52 @@ mod tests {
         assert_eq!(fold.positive_count, 2);
         assert_eq!(fold.negative_count, 1);
         assert_eq!(fold.fold.len(), 3);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn sampled_fold_keeps_all_positives_and_caps_negatives_by_class() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "npc-smarts-dataset-sampling-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let create_dir_result = std::fs::create_dir_all(&temp_dir);
+        assert!(create_dir_result.is_ok());
+
+        let split_path = temp_dir.join("train.parquet");
+        write_split_parquet(
+            &split_path,
+            &[
+                ("CCN", 1, vec![], vec![], vec![0]),
+                ("CN", 2, vec![], vec![], vec![0]),
+                ("CCO", 3, vec![], vec![], vec![1]),
+                ("CO", 4, vec![], vec![], vec![1]),
+                ("CCC", 5, vec![], vec![], vec![2]),
+                ("CC", 6, vec![], vec![], vec![2]),
+                ("O", 7, vec![], vec![], vec![]),
+                ("N", 8, vec![], vec![], vec![]),
+            ],
+        );
+
+        let loaded = DatasetSplit::load(&split_path, "train");
+        assert!(loaded.is_ok());
+        let Ok(loaded) = loaded else { unreachable!() };
+        let progress_bar = ProgressBar::hidden();
+        let counts = loaded.sampled_counts_with_progress(LabelHead::Class, 0, 1, &progress_bar);
+        assert_eq!(
+            counts,
+            FoldSelectionCounts {
+                positive_count: 2,
+                negative_count: 3,
+            }
+        );
+
+        let fold = loaded.build_sampled_fold_with_progress(LabelHead::Class, 0, 1, &progress_bar);
+        assert_eq!(fold.positive_count, 2);
+        assert_eq!(fold.negative_count, 3);
+        assert_eq!(fold.fold.len(), 5);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

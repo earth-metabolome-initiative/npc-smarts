@@ -8,14 +8,14 @@ use clap::{Parser, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Serialize;
 use smarts_evolution::{
-    EvolutionConfig as SmartsEvolutionConfig, EvolutionError, EvolutionProgress, EvolutionStatus,
-    EvolutionTask, RankedSmarts, SeedCorpus, SmartsEvaluator, SmartsGenome,
-    evolve_task_with_progress,
+    EvolutionConfig as SmartsEvolutionConfig, EvolutionError, EvolutionProgress, EvolutionSession,
+    EvolutionStatus, EvolutionTask, FoldData, RankedSmarts, SeedCorpus, SmartsEvaluator,
+    SmartsGenome, TaskResult,
 };
 use thiserror::Error;
 use zenodo_rs::ZenodoError;
 
-use crate::dataset::{DatasetSplit, LabelHead, Vocabulary};
+use crate::dataset::{DatasetSplit, FoldSelectionCounts, LabelHead, Vocabulary};
 use crate::download::{
     DISTILLATION_DATASET_DOI, DISTILLATION_DATASET_RECORD_ID, DownloadedDatasetFile,
     ensure_distillation_dataset,
@@ -75,6 +75,8 @@ pub struct ExperimentConfig {
     pub min_validation_positives: usize,
     #[arg(long, default_value_t = 1)]
     pub min_test_positives: usize,
+    #[arg(long, default_value_t = 512)]
+    pub max_negatives_per_npc_class: usize,
     #[arg(long, default_value_t = 32)]
     pub leaderboard_size: usize,
     #[arg(long, value_enum, default_value_t = SelectionStrategy::ValidationBestLeader)]
@@ -303,8 +305,16 @@ impl ExperimentProgress {
         self.task_bar.set_length(1);
         self.task_bar.set_position(0);
         self.task_bar.set_message(format!(
-            "{task_name} | preparing folds | train={train_len} validation={validation_len} test={test_len}"
+            "{task_name} | preparing sampled task sets | train={train_len} validation={validation_len} test={test_len}"
         ));
+        self.task_bar.tick();
+    }
+
+    fn set_task_phase(&self, task_name: &str, steps: usize, message: String) {
+        self.overall_bar.set_message(task_name.to_owned());
+        self.task_bar.set_length(usize_to_u64(steps.max(1)));
+        self.task_bar.set_position(0);
+        self.task_bar.set_message(message);
         self.task_bar.tick();
     }
 
@@ -476,13 +486,12 @@ fn run_label_task(
         inputs.test.len(),
     );
 
-    let train_fold = inputs.train.build_fold(head, label_id);
-    let validation_fold = inputs.validation.build_fold(head, label_id);
-    let test_fold = inputs.test.build_fold(head, label_id);
-
-    let train_counts = counts_from_fold(&train_fold);
-    let validation_counts = counts_from_fold(&validation_fold);
-    let test_counts = counts_from_fold(&test_fold);
+    let train_counts =
+        sampled_counts_from_split(task_context, &task_name, &inputs.train, head, label_id);
+    let validation_counts =
+        sampled_counts_from_split(task_context, &task_name, &inputs.validation, head, label_id);
+    let test_counts =
+        sampled_counts_from_split(task_context, &task_name, &inputs.test, head, label_id);
 
     if let Some(reason) = skip_reason(config, &train_counts, &validation_counts, &test_counts) {
         let skipped = SkippedTaskReport {
@@ -498,20 +507,39 @@ fn run_label_task(
         return Ok(TaskOutcome::Skipped(skipped));
     }
 
-    let train_evaluator = SmartsEvaluator::new(vec![train_fold.fold.clone()]);
-    let validation_evaluator = SmartsEvaluator::new(vec![validation_fold.fold.clone()]);
-    let test_evaluator = SmartsEvaluator::new(vec![test_fold.fold.clone()]);
-    let task = EvolutionTask::new(task_name.clone(), vec![train_fold.fold]);
-    let result = evolve_task_with_progress(
-        &task,
+    let train_fold = inputs.train.build_sampled_fold_with_progress(
+        head,
+        label_id,
+        config.max_negatives_per_npc_class,
+        &progress.task_bar,
+    );
+    let result = evolve_fold_with_progress(
+        &task_name,
+        train_fold.fold,
         evolution_config,
         seed_corpus,
         config.leaderboard_size,
-        |progress_update| {
-            update_progress(task_context.progress, &task_name, &progress_update);
-        },
+        task_context.progress,
     )?;
 
+    let validation_evaluator = {
+        let validation_fold = inputs.validation.build_sampled_fold_with_progress(
+            head,
+            label_id,
+            config.max_negatives_per_npc_class,
+            &progress.task_bar,
+        );
+        SmartsEvaluator::new(vec![validation_fold.fold])
+    };
+    let test_evaluator = {
+        let test_fold = inputs.test.build_sampled_fold_with_progress(
+            head,
+            label_id,
+            config.max_negatives_per_npc_class,
+            &progress.task_bar,
+        );
+        SmartsEvaluator::new(vec![test_fold.fold])
+    };
     let candidates = evaluate_candidates(
         &task_name,
         result.leaders(),
@@ -526,7 +554,7 @@ fn run_label_task(
         &validation_evaluator,
         &test_evaluator,
     )?;
-    let selected_train_mcc = evaluate_smarts(&task_name, &selected.smarts, &train_evaluator)?;
+    let selected_train_mcc = selected.train_mcc;
 
     let report = CompletedTaskReport {
         head,
@@ -551,6 +579,67 @@ fn run_label_task(
     Ok(TaskOutcome::Completed(report))
 }
 
+fn sampled_counts_from_split(
+    task_context: &TaskRunContext<'_>,
+    task_name: &str,
+    split: &DatasetSplit,
+    head: LabelHead,
+    label_id: u16,
+) -> SplitCounts {
+    task_context.progress.set_task_phase(
+        task_name,
+        split.len(),
+        format!(
+            "{} | counting sampled {}:{label_id} rows",
+            split.name(),
+            head.as_str()
+        ),
+    );
+    let counts = split.sampled_counts_with_progress(
+        head,
+        label_id,
+        task_context.config.max_negatives_per_npc_class,
+        &task_context.progress.task_bar,
+    );
+    counts_from_selection_counts(counts)
+}
+
+fn evolve_fold_with_progress(
+    task_name: &str,
+    train_fold: FoldData,
+    evolution_config: &SmartsEvolutionConfig,
+    seed_corpus: &SeedCorpus,
+    leaderboard_size: usize,
+    progress: &ExperimentProgress,
+) -> Result<TaskResult, ExperimentError> {
+    progress.set_task_phase(
+        task_name,
+        usize::try_from(evolution_config.generation_limit()).unwrap_or(usize::MAX),
+        format!("{task_name} | initializing evolution"),
+    );
+    let task = EvolutionTask::new(task_name.to_owned(), vec![train_fold]);
+    let mut session =
+        EvolutionSession::new(&task, evolution_config, seed_corpus, leaderboard_size)?;
+    drop(task);
+
+    while let Some(progress_update) = session.step() {
+        update_progress(progress, task_name, &progress_update);
+        if session.is_finished() {
+            return session.take_result().ok_or_else(|| {
+                ExperimentError::Evolution(EvolutionError::InvalidConfig(
+                    "finished evolution session did not expose a terminal result".to_owned(),
+                ))
+            });
+        }
+    }
+
+    session.take_result().ok_or_else(|| {
+        ExperimentError::Evolution(EvolutionError::InvalidConfig(
+            "evolution session ended unexpectedly".to_owned(),
+        ))
+    })
+}
+
 fn append_task_log_entry(path: &Path, outcome: &TaskOutcome) -> Result<(), ExperimentError> {
     let log_entry = match outcome {
         TaskOutcome::Completed(report) => TaskLogEntry::Completed(report.clone()),
@@ -569,11 +658,11 @@ fn count_outcomes(outcomes: &[TaskOutcome]) -> (usize, usize) {
     )
 }
 
-fn counts_from_fold(fold: &crate::dataset::LabeledFold) -> SplitCounts {
+fn counts_from_selection_counts(counts: FoldSelectionCounts) -> SplitCounts {
     SplitCounts {
-        rows: fold.positive_count + fold.negative_count,
-        positives: fold.positive_count,
-        negatives: fold.negative_count,
+        rows: counts.positive_count + counts.negative_count,
+        positives: counts.positive_count,
+        negatives: counts.negative_count,
     }
 }
 
@@ -657,7 +746,7 @@ fn input_split_progress_style() -> ProgressStyle {
 
 fn task_progress_style() -> ProgressStyle {
     let style = match ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.yellow/red}] {pos}/{len} generations | {msg}",
+        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.yellow/red}] {pos}/{len} steps | {msg}",
     ) {
         Ok(style) => style,
         Err(_) => ProgressStyle::default_bar(),
@@ -677,7 +766,9 @@ fn update_progress(
         .set_length(progress.generation_limit().max(1));
     progress_ui.task_bar.set_position(progress.generation());
     progress_ui.task_bar.set_message(format!(
-        "{task_name} | status={:?} | best={:.4} | complexity={} | smarts={smarts}",
+        "{task_name} | generation={}/{} | status={:?} | best={:.4} | complexity={} | smarts={smarts}",
+        progress.generation(),
+        progress.generation_limit(),
         progress.status(),
         best.mcc(),
         best.complexity(),
@@ -826,6 +917,7 @@ mod tests {
             min_train_positives: 1,
             min_validation_positives: 1,
             min_test_positives: 1,
+            max_negatives_per_npc_class: 512,
             leaderboard_size: 32,
             selection_strategy: SelectionStrategy::ValidationBestLeader,
             population_size: 384,
