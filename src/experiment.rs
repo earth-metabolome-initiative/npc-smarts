@@ -8,9 +8,9 @@ use clap::{Parser, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Serialize;
 use smarts_evolution::{
-    EvolutionConfig as SmartsEvolutionConfig, EvolutionError, EvolutionProgress, EvolutionSession,
-    EvolutionStatus, EvolutionTask, FoldData, RankedSmarts, SeedCorpus, SmartsEvaluator,
-    SmartsGenome, TaskResult,
+    EvolutionConfig as SmartsEvolutionConfig, EvolutionError, EvolutionTask, FoldData,
+    IndicatifEvolutionProgress, RankedSmarts, SeedCorpus, SmartsEvaluator, SmartsGenome,
+    TaskResult,
 };
 use thiserror::Error;
 use zenodo_rs::ZenodoError;
@@ -655,44 +655,15 @@ fn evolve_fold_with_progress(
     progress.set_task_phase(
         task_name,
         usize::try_from(evolution_config.generation_limit()).unwrap_or(usize::MAX),
-        format!("{task_name} | initializing evolution"),
+        format!("{task_name} | evolution progress from smarts-evolution"),
     );
     let task = EvolutionTask::new(task_name.to_owned(), vec![train_fold]);
-    let mut session =
-        EvolutionSession::new(&task, evolution_config, seed_corpus, leaderboard_size)?;
-    drop(task);
-    let generation_limit = evolution_config.generation_limit().max(1);
-    let mut next_generation = 1;
-
-    while next_generation <= generation_limit {
-        progress.task_bar.set_length(generation_limit);
-        progress
-            .task_bar
-            .set_position(next_generation.saturating_sub(1));
-        progress.task_bar.set_message(format!(
-            "{task_name} | evaluating generation {next_generation}/{generation_limit}"
-        ));
-        progress.task_bar.tick();
-
-        let Some(progress_update) = session.step() else {
-            break;
-        };
-        update_progress(progress, task_name, &progress_update);
-        next_generation = progress_update.generation().saturating_add(1);
-        if session.is_finished() {
-            return session.take_result().ok_or_else(|| {
-                ExperimentError::Evolution(EvolutionError::InvalidConfig(
-                    "finished evolution session did not expose a terminal result".to_owned(),
-                ))
-            });
-        }
-    }
-
-    session.take_result().ok_or_else(|| {
-        ExperimentError::Evolution(EvolutionError::InvalidConfig(
-            "evolution session ended unexpectedly".to_owned(),
-        ))
-    })
+    Ok(task.evolve_with_indicatif_progress(
+        evolution_config,
+        seed_corpus,
+        leaderboard_size,
+        IndicatifEvolutionProgress::new().with_best_smarts_width(72),
+    )?)
 }
 
 fn append_task_log_entry(path: &Path, outcome: &TaskOutcome) -> Result<(), ExperimentError> {
@@ -807,40 +778,6 @@ fn task_progress_style() -> ProgressStyle {
         Err(_) => ProgressStyle::default_bar(),
     };
     style.progress_chars("=> ")
-}
-
-fn update_progress(
-    progress_ui: &ExperimentProgress,
-    task_name: &str,
-    progress: &EvolutionProgress,
-) {
-    let best = progress.best();
-    let smarts = truncate_progress_message(best.smarts(), 48);
-    progress_ui
-        .task_bar
-        .set_length(progress.generation_limit().max(1));
-    progress_ui.task_bar.set_position(progress.generation());
-    progress_ui.task_bar.set_message(format!(
-        "{task_name} | generation={}/{} | status={:?} | best={:.4} | complexity={} | smarts={smarts}",
-        progress.generation(),
-        progress.generation_limit(),
-        progress.status(),
-        best.mcc(),
-        best.complexity(),
-    ));
-    if progress.status() != EvolutionStatus::Running {
-        progress_ui.task_bar.tick();
-    }
-}
-
-fn truncate_progress_message(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_owned();
-    }
-
-    let keep_chars = max_chars.saturating_sub(3);
-    let prefix: String = text.chars().take(keep_chars).collect();
-    format!("{prefix}...")
 }
 
 fn usize_to_u64(value: usize) -> u64 {

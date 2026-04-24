@@ -1907,11 +1907,12 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smarts-evolution"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-evolution?branch=main#2f271e094c1dcad4282fa773efc3974c41c3b2fd"
+source = "git+https://github.com/earth-metabolome-initiative/smarts-evolution?branch=main#4f0ba05c1969b467e10e8213e331f2919c8830d0"
 dependencies = [
  "elements_rs",
  "getrandom 0.4.2",
  "hashbrown 0.17.0",
+ "indicatif",
  "log",
  "rand 0.10.1",
  "rayon",
@@ -1922,7 +1923,7 @@ dependencies = [
 [[package]]
 name = "smarts-rs"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#a0a083a5efb38329405b89071ce9a0313983bb3d"
+source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#e0e4e1b1337abab9e27f09dfd1cffded00b487a8"
 dependencies = [
  "elements_rs",
  "geometric-traits",
@@ -2041,7 +2042,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
