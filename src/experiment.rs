@@ -83,7 +83,7 @@ pub struct ExperimentConfig {
     pub leaderboard_size: usize,
     #[arg(long, value_enum, default_value_t = SelectionStrategy::ValidationBestLeader)]
     pub selection_strategy: SelectionStrategy,
-    #[arg(long, default_value_t = 384)]
+    #[arg(long, default_value_t = 1024)]
     pub population_size: usize,
     #[arg(long, default_value_t = 800)]
     pub generation_limit: u64,
@@ -382,10 +382,32 @@ struct TaskRunContext<'a> {
     inputs: &'a LoadedInputs,
 }
 
+#[derive(Debug, Clone)]
 struct TaskSplitCounts {
     train: SplitCounts,
     validation: SplitCounts,
     test: SplitCounts,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedLabelTask {
+    ordinal: usize,
+    head: LabelHead,
+    label_id: u16,
+    label_name: String,
+    train_positives: usize,
+    total_positives: usize,
+}
+
+impl PlannedLabelTask {
+    fn task_name(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.head.as_str(),
+            self.label_id,
+            self.label_name
+        )
+    }
 }
 
 /// Run the full end-to-end experiment over the published distillation splits.
@@ -472,23 +494,13 @@ fn run_all_tasks(
         progress: &progress,
         inputs,
     };
+    let task_plan = sorted_task_plan(&task_context)?;
     let mut outcomes = Vec::new();
 
-    for head in LabelHead::ALL {
-        let labels = inputs.vocabulary.labels(head);
-        let max_labels = config.max_labels_per_head.unwrap_or(labels.len());
-
-        for (label_index, label_name) in labels.iter().enumerate().take(max_labels) {
-            let label_id = u16::try_from(label_index).map_err(|error| {
-                ExperimentError::InvalidDataset(format!(
-                    "label index {label_index} overflowed u16 for {}: {error}",
-                    head.as_str()
-                ))
-            })?;
-            let outcome = run_label_task(&task_context, head, label_id, label_name)?;
-            append_task_log_entry(results_path, &outcome)?;
-            outcomes.push(outcome);
-        }
+    for task in &task_plan {
+        let outcome = run_label_task(&task_context, task)?;
+        append_task_log_entry(results_path, &outcome)?;
+        outcomes.push(outcome);
     }
 
     let (completed_tasks, skipped_tasks) = count_outcomes(&outcomes);
@@ -498,9 +510,7 @@ fn run_all_tasks(
 
 fn run_label_task(
     task_context: &TaskRunContext<'_>,
-    head: LabelHead,
-    label_id: u16,
-    label_name: &str,
+    task: &PlannedLabelTask,
 ) -> Result<TaskOutcome, ExperimentError> {
     let TaskRunContext {
         config,
@@ -509,7 +519,7 @@ fn run_label_task(
         progress,
         inputs,
     } = task_context;
-    let task_name = format!("{}:{label_id}:{label_name}", head.as_str());
+    let task_name = task.task_name();
     progress.start_task(
         &task_name,
         inputs.train.len(),
@@ -517,13 +527,13 @@ fn run_label_task(
         inputs.test.len(),
     );
 
-    let counts = sampled_counts_for_task(task_context, &task_name, head, label_id);
+    let counts = sampled_counts_for_task(task_context, &task_name, task.head, task.label_id);
 
     if let Some(reason) = skip_reason(config, &counts.train, &counts.validation, &counts.test) {
         let skipped = SkippedTaskReport {
-            head,
-            label_id,
-            label_name: label_name.to_owned(),
+            head: task.head,
+            label_id: task.label_id,
+            label_name: task.label_name.clone(),
             reason,
             train_counts: counts.train,
             validation_counts: counts.validation,
@@ -534,8 +544,8 @@ fn run_label_task(
     }
 
     let train_fold = inputs.train.build_sampled_fold_with_progress(
-        head,
-        label_id,
+        task.head,
+        task.label_id,
         config.max_positives_per_npc_class,
         config.max_negatives_per_npc_class,
         &progress.task_bar,
@@ -550,7 +560,7 @@ fn run_label_task(
     )?;
 
     let (validation_evaluator, test_evaluator) =
-        build_holdout_evaluators(task_context, head, label_id)?;
+        build_holdout_evaluators(task_context, task.head, task.label_id)?;
     let candidates = evaluate_candidates(
         &task_name,
         result.leaders(),
@@ -569,9 +579,9 @@ fn run_label_task(
     let selected_train_mcc = selected.train_mcc;
 
     let report = CompletedTaskReport {
-        head,
-        label_id,
-        label_name: label_name.to_owned(),
+        head: task.head,
+        label_id: task.label_id,
+        label_name: task.label_name.clone(),
         selection_strategy: config.selection_strategy,
         generations: result.generations(),
         train_counts: counts.train,
@@ -589,6 +599,65 @@ fn run_label_task(
     progress.log_done(&report);
 
     Ok(TaskOutcome::Completed(report))
+}
+
+fn sorted_task_plan(
+    task_context: &TaskRunContext<'_>,
+) -> Result<Vec<PlannedLabelTask>, ExperimentError> {
+    let config = task_context.config;
+    let vocabulary = &task_context.inputs.vocabulary;
+    let mut tasks = Vec::with_capacity(total_task_count(config, vocabulary));
+
+    for head in LabelHead::ALL {
+        let labels = vocabulary.labels(head);
+        let max_labels = config.max_labels_per_head.unwrap_or(labels.len());
+        let train_positives = task_context
+            .inputs
+            .train
+            .label_positive_counts(head, labels.len());
+        let validation_positives = task_context
+            .inputs
+            .validation
+            .label_positive_counts(head, labels.len());
+        let test_positives = task_context
+            .inputs
+            .test
+            .label_positive_counts(head, labels.len());
+
+        for (label_index, label_name) in labels.iter().enumerate().take(max_labels) {
+            let label_id = u16::try_from(label_index).map_err(|error| {
+                ExperimentError::InvalidDataset(format!(
+                    "label index {label_index} overflowed u16 for {}: {error}",
+                    head.as_str()
+                ))
+            })?;
+            let train_count = train_positives[label_index];
+            tasks.push(PlannedLabelTask {
+                ordinal: tasks.len(),
+                head,
+                label_id,
+                label_name: label_name.clone(),
+                train_positives: train_count,
+                total_positives: train_count
+                    + validation_positives[label_index]
+                    + test_positives[label_index],
+            });
+        }
+    }
+
+    sort_task_plan(&mut tasks);
+    Ok(tasks)
+}
+
+fn sort_task_plan(tasks: &mut [PlannedLabelTask]) {
+    tasks.sort_by(compare_planned_tasks);
+}
+
+fn compare_planned_tasks(left: &PlannedLabelTask, right: &PlannedLabelTask) -> Ordering {
+    left.train_positives
+        .cmp(&right.train_positives)
+        .then_with(|| left.total_positives.cmp(&right.total_positives))
+        .then_with(|| left.ordinal.cmp(&right.ordinal))
 }
 
 fn sampled_counts_for_task(
@@ -965,7 +1034,7 @@ mod tests {
             max_negatives_per_npc_class: 512,
             leaderboard_size: 32,
             selection_strategy: SelectionStrategy::ValidationBestLeader,
-            population_size: 384,
+            population_size: 1024,
             generation_limit: 800,
             mutation_rate: 0.90,
             crossover_rate: 0.75,
@@ -1112,6 +1181,53 @@ mod tests {
         }
     }
 
+    fn planned_task(
+        ordinal: usize,
+        label_id: u16,
+        label_name: &str,
+        train_positives: usize,
+        validation_positives: usize,
+        test_positives: usize,
+    ) -> PlannedLabelTask {
+        PlannedLabelTask {
+            ordinal,
+            head: LabelHead::Class,
+            label_id,
+            label_name: label_name.to_owned(),
+            train_positives,
+            total_positives: train_positives + validation_positives + test_positives,
+        }
+    }
+
+    fn planned_class_task(
+        task_context: &TaskRunContext<'_>,
+        label_id: u16,
+        label_name: &str,
+    ) -> PlannedLabelTask {
+        let label_index = usize::from(label_id);
+        let label_count = label_index + 1;
+        let train_positives = task_context
+            .inputs
+            .train
+            .label_positive_counts(LabelHead::Class, label_count)[label_index];
+        let validation_positives = task_context
+            .inputs
+            .validation
+            .label_positive_counts(LabelHead::Class, label_count)[label_index];
+        let test_positives = task_context
+            .inputs
+            .test
+            .label_positive_counts(LabelHead::Class, label_count)[label_index];
+        PlannedLabelTask {
+            ordinal: 0,
+            head: LabelHead::Class,
+            label_id,
+            label_name: label_name.to_owned(),
+            train_positives,
+            total_positives: train_positives + validation_positives + test_positives,
+        }
+    }
+
     #[test]
     fn label_head_iteration_order_is_stable() {
         assert_eq!(
@@ -1133,12 +1249,27 @@ mod tests {
     }
 
     #[test]
+    fn task_plan_sort_starts_with_fewest_training_examples() {
+        let mut tasks = vec![
+            planned_task(0, 0, "many", 10, 1, 1),
+            planned_task(1, 1, "few", 2, 4, 4),
+            planned_task(2, 2, "same_train_fewer_total", 2, 1, 1),
+        ];
+
+        sort_task_plan(&mut tasks);
+
+        assert_eq!(tasks[0].label_name, "same_train_fewer_total");
+        assert_eq!(tasks[1].label_name, "few");
+        assert_eq!(tasks[2].label_name, "many");
+    }
+
+    #[test]
     fn evolution_config_uses_aggressive_defaults() {
         let config = baseline_config();
         let built = config.evolution_config();
         assert!(built.is_ok());
         let Ok(built) = built else { unreachable!() };
-        assert_eq!(built.population_size(), 384);
+        assert_eq!(built.population_size(), 1024);
         assert_eq!(built.generation_limit(), 800);
         assert_eq!(built.stagnation_limit(), 120);
         assert_eq!(built.tournament_size(), 5);
@@ -1406,7 +1537,8 @@ mod tests {
             progress: &progress,
             inputs: &inputs,
         };
-        let outcome = run_label_task(&task_context, LabelHead::Class, 0, "amine");
+        let task = planned_class_task(&task_context, 0, "amine");
+        let outcome = run_label_task(&task_context, &task);
         assert!(outcome.is_ok());
         let Ok(TaskOutcome::Completed(report)) = outcome else {
             unreachable!();
@@ -1447,7 +1579,8 @@ mod tests {
             progress: &progress,
             inputs: &inputs,
         };
-        let outcome = run_label_task(&task_context, LabelHead::Class, 0, "amine");
+        let task = planned_class_task(&task_context, 0, "amine");
+        let outcome = run_label_task(&task_context, &task);
         assert!(matches!(outcome, Ok(TaskOutcome::Skipped(_))));
 
         let _ = std::fs::remove_dir_all(temp_dir);

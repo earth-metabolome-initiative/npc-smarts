@@ -171,6 +171,19 @@ impl DatasetSplit {
         self.rows.is_empty()
     }
 
+    #[must_use]
+    pub fn label_positive_counts(&self, head: LabelHead, label_count: usize) -> Vec<usize> {
+        let mut counts = vec![0usize; label_count];
+        for row in &self.rows {
+            for &label_id in row.labels(head) {
+                if let Some(count) = counts.get_mut(usize::from(label_id)) {
+                    *count += 1;
+                }
+            }
+        }
+        counts
+    }
+
     /// Build an unsampled labeled evaluation set.
     ///
     /// # Errors
@@ -713,6 +726,11 @@ mod tests {
         assert_eq!(loaded.rows()[0].smiles, "CCN");
         assert_eq!(loaded.rows()[0].labels(LabelHead::Class), &[2]);
         assert!(loaded.rows()[1].labels(LabelHead::Pathway).is_empty());
+        assert_eq!(
+            loaded.label_positive_counts(LabelHead::Class, 4),
+            vec![0, 0, 2, 0]
+        );
+        assert_eq!(loaded.label_positive_counts(LabelHead::Pathway, 1), vec![2]);
 
         let fold = loaded.build_fold(LabelHead::Class, 2);
         assert!(fold.is_ok());
