@@ -19,4 +19,6 @@ By default, each train/validation/test task set samples up to 512 positives and
 
 Slow SMARTS warnings are logged by default after 30 seconds. Use
 `--slow-evaluation-log-threshold-millis`, `--max-evaluation-smarts-complexity`,
-and `--max-evaluation-smarts-len` to tighten evaluation guardrails.
+and `--max-evaluation-smarts-len` to tighten evaluation guardrails. The run
+writes these warnings to `artifacts/slow-smarts.log` without colliding with the
+progress bars.
