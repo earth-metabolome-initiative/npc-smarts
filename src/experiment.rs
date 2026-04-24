@@ -272,6 +272,7 @@ impl InputLoadProgress {
 }
 
 struct ExperimentProgress {
+    multi_progress: MultiProgress,
     overall_bar: ProgressBar,
     task_bar: ProgressBar,
 }
@@ -291,6 +292,7 @@ impl ExperimentProgress {
         task_bar.set_message("waiting for first label");
 
         Self {
+            multi_progress,
             overall_bar,
             task_bar,
         }
@@ -658,11 +660,14 @@ fn evolve_fold_with_progress(
         format!("{task_name} | evolution progress from smarts-evolution"),
     );
     let task = EvolutionTask::new(task_name.to_owned(), vec![train_fold]);
-    Ok(task.evolve_with_indicatif_progress(
+    let evolution_progress = IndicatifEvolutionProgress::attach_to(&progress.multi_progress)
+        .with_best_smarts_width(72)
+        .clear_on_finish(true);
+    Ok(task.evolve_owned_with_indicatif_progress(
         evolution_config,
         seed_corpus,
         leaderboard_size,
-        IndicatifEvolutionProgress::new().with_best_smarts_width(72),
+        evolution_progress,
     )?)
 }
 
@@ -950,6 +955,18 @@ mod tests {
             stagnation_limit: 120,
             rng_seed: None,
             fitness_cache_capacity: 500_000,
+        }
+    }
+
+    fn hidden_experiment_progress() -> ExperimentProgress {
+        let multi_progress =
+            MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let overall_bar = multi_progress.add(ProgressBar::hidden());
+        let task_bar = multi_progress.add(ProgressBar::hidden());
+        ExperimentProgress {
+            multi_progress,
+            overall_bar,
+            task_bar,
         }
     }
 
@@ -1321,10 +1338,7 @@ mod tests {
         let Ok(evolution_config) = evolution_config else {
             unreachable!()
         };
-        let progress = ExperimentProgress {
-            overall_bar: ProgressBar::hidden(),
-            task_bar: ProgressBar::hidden(),
-        };
+        let progress = hidden_experiment_progress();
         let seed_corpus = SeedCorpus::builtin();
         let task_context = TaskRunContext {
             config: &config,
@@ -1365,10 +1379,7 @@ mod tests {
         let Ok(evolution_config) = evolution_config else {
             unreachable!()
         };
-        let progress = ExperimentProgress {
-            overall_bar: ProgressBar::hidden(),
-            task_bar: ProgressBar::hidden(),
-        };
+        let progress = hidden_experiment_progress();
         let seed_corpus = SeedCorpus::builtin();
         let task_context = TaskRunContext {
             config: &config,
