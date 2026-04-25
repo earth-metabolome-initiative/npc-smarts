@@ -21,7 +21,7 @@ Labels with fewer than 50 training examples are filtered out by default. Overrid
 with `--min-train-positives`.
 
 Slow SMARTS warnings are logged by default after 30 seconds. SMARTS matching
-also has a cooperative 30 second per-match time limit by default, and SMARTS
+also has a cooperative 3 second per-match time limit by default, and SMARTS
 length can be capped before evaluation. Use
 `--slow-evaluation-log-threshold-millis`, `--match-time-limit-millis`, and
 `--max-evaluation-smarts-len` to tune evaluation guardrails. The run writes
