@@ -106,9 +106,11 @@ pub struct ExperimentConfig {
     #[arg(long, default_value_t = 500_000)]
     pub fitness_cache_capacity: usize,
     #[arg(long)]
-    pub max_evaluation_smarts_complexity: Option<usize>,
-    #[arg(long)]
     pub max_evaluation_smarts_len: Option<usize>,
+    #[arg(long, default_value_t = 30_000)]
+    pub match_time_limit_millis: u64,
+    #[arg(long)]
+    pub disable_match_time_limit: bool,
     #[arg(long, default_value_t = 30_000)]
     pub slow_evaluation_log_threshold_millis: u64,
     #[arg(long)]
@@ -137,11 +139,13 @@ impl ExperimentConfig {
         if let Some(seed) = self.rng_seed {
             builder = builder.rng_seed(seed);
         }
-        if let Some(max_complexity) = self.max_evaluation_smarts_complexity {
-            builder = builder.max_evaluation_smarts_complexity(max_complexity);
-        }
         if let Some(max_len) = self.max_evaluation_smarts_len {
             builder = builder.max_evaluation_smarts_len(max_len);
+        }
+        if self.disable_match_time_limit || self.match_time_limit_millis == 0 {
+            builder = builder.disable_match_time_limit();
+        } else {
+            builder = builder.match_time_limit(Duration::from_millis(self.match_time_limit_millis));
         }
         if self.disable_slow_evaluation_logging || self.slow_evaluation_log_threshold_millis == 0 {
             builder = builder.disable_slow_evaluation_logging();
@@ -167,7 +171,7 @@ pub struct SplitCounts {
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidateScore {
     pub smarts: String,
-    pub complexity: usize,
+    pub smarts_len: usize,
     pub train_mcc: f64,
     pub validation_mcc: f64,
     pub test_mcc: f64,
@@ -186,7 +190,7 @@ pub struct CompletedTaskReport {
     pub train_best_smarts: String,
     pub train_best_mcc: f64,
     pub selected_smarts: String,
-    pub selected_complexity: usize,
+    pub selected_smarts_len: usize,
     pub selected_train_mcc: f64,
     pub selected_validation_mcc: f64,
     pub selected_test_mcc: f64,
@@ -590,7 +594,7 @@ fn run_label_task(
         train_best_smarts: result.best_smarts().to_owned(),
         train_best_mcc: result.best_mcc(),
         selected_smarts: selected.smarts.clone(),
-        selected_complexity: selected.complexity,
+        selected_smarts_len: selected.smarts_len,
         selected_train_mcc,
         selected_validation_mcc: selected.validation_mcc,
         selected_test_mcc: selected.test_mcc,
@@ -911,7 +915,7 @@ fn evaluate_candidates(
             .set_position(usize_to_u64(completed_steps));
         candidates.push(CandidateScore {
             smarts: leader.smarts().to_owned(),
-            complexity: leader.complexity(),
+            smarts_len: leader.smarts_len(),
             train_mcc: leader.mcc(),
             validation_mcc,
             test_mcc,
@@ -935,26 +939,13 @@ fn select_candidate(
                 "task {task_id} did not produce any leader candidates"
             ))
         }),
-        SelectionStrategy::TrainBest => {
-            let complexity = SmartsGenome::from_smarts(result.best_smarts())
-                .map_err(|message| ExperimentError::InvalidSmarts {
-                    task_id: task_id.to_owned(),
-                    smarts: result.best_smarts().to_owned(),
-                    message,
-                })?
-                .complexity();
-            Ok(CandidateScore {
-                smarts: result.best_smarts().to_owned(),
-                complexity,
-                train_mcc: result.best_mcc(),
-                validation_mcc: evaluate_smarts(
-                    task_id,
-                    result.best_smarts(),
-                    validation_evaluator,
-                )?,
-                test_mcc: evaluate_smarts(task_id, result.best_smarts(), test_evaluator)?,
-            })
-        }
+        SelectionStrategy::TrainBest => Ok(CandidateScore {
+            smarts: result.best_smarts().to_owned(),
+            smarts_len: result.best_smarts_len(),
+            train_mcc: result.best_mcc(),
+            validation_mcc: evaluate_smarts(task_id, result.best_smarts(), validation_evaluator)?,
+            test_mcc: evaluate_smarts(task_id, result.best_smarts(), test_evaluator)?,
+        }),
     }
 }
 
@@ -963,7 +954,7 @@ fn compare_candidates(left: &CandidateScore, right: &CandidateScore) -> Ordering
         .validation_mcc
         .partial_cmp(&left.validation_mcc)
         .unwrap_or(Ordering::Equal)
-        .then_with(|| left.complexity.cmp(&right.complexity))
+        .then_with(|| left.smarts_len.cmp(&right.smarts_len))
         .then_with(|| {
             right
                 .train_mcc
@@ -1039,8 +1030,9 @@ mod tests {
             stagnation_limit: 120,
             rng_seed: None,
             fitness_cache_capacity: 500_000,
-            max_evaluation_smarts_complexity: None,
             max_evaluation_smarts_len: None,
+            match_time_limit_millis: 30_000,
+            disable_match_time_limit: false,
             slow_evaluation_log_threshold_millis: 30_000,
             disable_slow_evaluation_logging: false,
         }
@@ -1330,7 +1322,7 @@ mod tests {
         assert_eq!(built.tournament_size(), 5);
         assert_eq!(built.elite_count(), 8);
         assert_eq!(built.fitness_cache_capacity(), 500_000);
-        assert_eq!(built.max_evaluation_smarts_complexity(), 1536);
+        assert_eq!(built.match_time_limit(), Some(Duration::from_secs(30)));
         assert_eq!(
             built.slow_evaluation_log_threshold(),
             Some(Duration::from_secs(30))
@@ -1345,19 +1337,30 @@ mod tests {
     #[test]
     fn evolution_config_forwards_slow_smarts_controls() {
         let mut config = baseline_config();
-        config.max_evaluation_smarts_complexity = Some(8);
         config.max_evaluation_smarts_len = Some(96);
+        config.match_time_limit_millis = 250;
         config.slow_evaluation_log_threshold_millis = 250;
 
         let built = config.evolution_config();
         assert!(built.is_ok());
         let Ok(built) = built else { unreachable!() };
-        assert_eq!(built.max_evaluation_smarts_complexity(), 8);
         assert_eq!(built.max_evaluation_smarts_len(), Some(96));
+        assert_eq!(built.match_time_limit(), Some(Duration::from_millis(250)));
         assert_eq!(
             built.slow_evaluation_log_threshold(),
             Some(Duration::from_millis(250))
         );
+    }
+
+    #[test]
+    fn evolution_config_can_disable_match_time_limit() {
+        let mut config = baseline_config();
+        config.disable_match_time_limit = true;
+
+        let built = config.evolution_config();
+        assert!(built.is_ok());
+        let Ok(built) = built else { unreachable!() };
+        assert_eq!(built.match_time_limit(), None);
     }
 
     #[test]
@@ -1397,7 +1400,7 @@ mod tests {
             train_best_smarts: String::from("[#6]"),
             train_best_mcc: 1.0,
             selected_smarts: String::from("[#6]"),
-            selected_complexity: 1,
+            selected_smarts_len: 4,
             selected_train_mcc: 1.0,
             selected_validation_mcc: 1.0,
             selected_test_mcc: 1.0,
@@ -1462,21 +1465,21 @@ mod tests {
         let mut candidates = [
             CandidateScore {
                 smarts: String::from("[#6]~[#7]"),
-                complexity: 2,
+                smarts_len: 9,
                 train_mcc: 0.9,
                 validation_mcc: 0.8,
                 test_mcc: 0.7,
             },
             CandidateScore {
                 smarts: String::from("[#7]"),
-                complexity: 1,
+                smarts_len: 4,
                 train_mcc: 0.7,
                 validation_mcc: 0.8,
                 test_mcc: 0.7,
             },
             CandidateScore {
                 smarts: String::from("[#8]"),
-                complexity: 1,
+                smarts_len: 4,
                 train_mcc: 1.0,
                 validation_mcc: 0.6,
                 test_mcc: 0.6,
