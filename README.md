@@ -13,8 +13,8 @@
 RUSTFLAGS="-C target-cpu=native" cargo run --release
 ```
 
-By default, each training/test task set samples up to 512 positives and 2048
-negatives per NPC class. Override with `--max-positives-per-npc-class` and
+By default, each training/test task set includes all positives and samples up
+to 4096 negatives per NPC class. Override negative sampling with
 `--max-negatives-per-npc-class`.
 
 Labels with fewer than 50 training examples are filtered out by default. Override
@@ -24,7 +24,7 @@ Results report both MCC and match coverage scores for the merged training pool
 and held-out test split.
 
 Slow SMARTS warnings are logged by default after 30 seconds. Each SMARTS
-evaluation also has a cooperative 1 second time limit by default, and SMARTS
+evaluation also has a cooperative 10 second time limit by default, and SMARTS
 length can be capped before evaluation. Use
 `--slow-evaluation-log-threshold-millis`, `--match-time-limit-millis`, and
 `--max-evaluation-smarts-len` to tune evaluation guardrails. The run writes

@@ -21,6 +21,8 @@ use crate::download::{
     ensure_distillation_dataset,
 };
 
+const ALL_POSITIVES_PER_NPC_CLASS: usize = usize::MAX;
+
 #[derive(Debug, Error)]
 pub enum ExperimentError {
     #[error(transparent)]
@@ -66,13 +68,11 @@ pub struct ExperimentConfig {
     pub min_train_positives: usize,
     #[arg(long, default_value_t = 1)]
     pub min_test_positives: usize,
-    #[arg(long, default_value_t = 512)]
-    pub max_positives_per_npc_class: usize,
-    #[arg(long, default_value_t = 2_048)]
+    #[arg(long, default_value_t = 4_096)]
     pub max_negatives_per_npc_class: usize,
     #[arg(long, default_value_t = 32)]
     pub leaderboard_size: usize,
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = 2048)]
     pub population_size: usize,
     #[arg(long, default_value_t = 800)]
     pub generation_limit: u64,
@@ -96,7 +96,7 @@ pub struct ExperimentConfig {
     pub fitness_cache_capacity: usize,
     #[arg(long)]
     pub max_evaluation_smarts_len: Option<usize>,
-    #[arg(long, default_value_t = 1_000)]
+    #[arg(long, default_value_t = 10_000)]
     pub match_time_limit_millis: u64,
     #[arg(long)]
     pub disable_match_time_limit: bool,
@@ -526,7 +526,7 @@ fn run_label_task(
     let training_fold = inputs.training.build_sampled_fold_with_progress(
         task.head,
         task.label_id,
-        config.max_positives_per_npc_class,
+        ALL_POSITIVES_PER_NPC_CLASS,
         config.max_negatives_per_npc_class,
         &progress.task_bar,
     )?;
@@ -662,7 +662,7 @@ fn sampled_counts_from_split(
     let counts = split.sampled_counts_with_progress(
         head,
         label_id,
-        task_context.config.max_positives_per_npc_class,
+        ALL_POSITIVES_PER_NPC_CLASS,
         task_context.config.max_negatives_per_npc_class,
         &task_context.progress.task_bar,
     );
@@ -679,7 +679,7 @@ fn build_test_evaluator(
     let test_fold = task_context.inputs.test.build_sampled_fold_with_progress(
         head,
         label_id,
-        config.max_positives_per_npc_class,
+        ALL_POSITIVES_PER_NPC_CLASS,
         config.max_negatives_per_npc_class,
         progress,
     )?;
@@ -945,10 +945,9 @@ mod tests {
             max_labels_per_head: None,
             min_train_positives: 50,
             min_test_positives: 1,
-            max_positives_per_npc_class: 512,
-            max_negatives_per_npc_class: 2_048,
+            max_negatives_per_npc_class: 4_096,
             leaderboard_size: 32,
-            population_size: 1024,
+            population_size: 2048,
             generation_limit: 800,
             mutation_rate: 0.90,
             crossover_rate: 0.75,
@@ -960,7 +959,7 @@ mod tests {
             rng_seed: None,
             fitness_cache_capacity: 500_000,
             max_evaluation_smarts_len: None,
-            match_time_limit_millis: 1_000,
+            match_time_limit_millis: 10_000,
             disable_match_time_limit: false,
             slow_evaluation_log_threshold_millis: 30_000,
             disable_slow_evaluation_logging: false,
@@ -1242,13 +1241,13 @@ mod tests {
         let built = config.evolution_config();
         assert!(built.is_ok());
         let Ok(built) = built else { unreachable!() };
-        assert_eq!(built.population_size(), 1024);
+        assert_eq!(built.population_size(), 2048);
         assert_eq!(built.generation_limit(), 800);
         assert_eq!(built.stagnation_limit(), 120);
         assert_eq!(built.tournament_size(), 5);
         assert_eq!(built.elite_count(), 8);
         assert_eq!(built.fitness_cache_capacity(), 500_000);
-        assert_eq!(built.match_time_limit(), Some(Duration::from_secs(1)));
+        assert_eq!(built.match_time_limit(), Some(Duration::from_secs(10)));
         assert_eq!(
             built.slow_evaluation_log_threshold(),
             Some(Duration::from_secs(30))

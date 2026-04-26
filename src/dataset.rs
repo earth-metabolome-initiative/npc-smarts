@@ -19,6 +19,14 @@ use crate::experiment::ExperimentError;
 
 const FOLD_PROGRESS_GRANULARITY: usize = 8_192;
 
+fn sample_limit_label(limit: usize) -> String {
+    if limit == usize::MAX {
+        "all".to_owned()
+    } else {
+        limit.to_string()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LabelHead {
@@ -323,8 +331,10 @@ impl DatasetSplit {
         let row_count = self.rows.len();
         progress_bar.set_length(usize_to_u64(row_count));
         progress_bar.set_position(0);
+        let max_positives_label = sample_limit_label(max_positives_per_class);
+        let max_negatives_label = sample_limit_label(max_negatives_per_class);
         progress_bar.set_message(format!(
-            "{} | selecting {}:{label_id} evaluation rows | max_positives_per_class={max_positives_per_class} max_negatives_per_class={max_negatives_per_class}",
+            "{} | selecting {}:{label_id} evaluation rows | max_positives_per_class={max_positives_label} max_negatives_per_class={max_negatives_label}",
             self.name,
             head.as_str()
         ));
