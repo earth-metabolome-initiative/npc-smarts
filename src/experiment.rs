@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Serialize;
 use smarts_evolution::{
@@ -54,13 +54,6 @@ pub enum ExperimentError {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum SelectionStrategy {
-    TrainBest,
-    ValidationBestLeader,
-}
-
 #[derive(Debug, Clone, Parser, Serialize)]
 pub struct ExperimentConfig {
     #[arg(long, default_value = "data")]
@@ -72,8 +65,6 @@ pub struct ExperimentConfig {
     #[arg(long, default_value_t = 50)]
     pub min_train_positives: usize,
     #[arg(long, default_value_t = 1)]
-    pub min_validation_positives: usize,
-    #[arg(long, default_value_t = 1)]
     pub min_test_positives: usize,
     #[arg(long, default_value_t = 512)]
     pub max_positives_per_npc_class: usize,
@@ -81,8 +72,6 @@ pub struct ExperimentConfig {
     pub max_negatives_per_npc_class: usize,
     #[arg(long, default_value_t = 32)]
     pub leaderboard_size: usize,
-    #[arg(long, value_enum, default_value_t = SelectionStrategy::ValidationBestLeader)]
-    pub selection_strategy: SelectionStrategy,
     #[arg(long, default_value_t = 1024)]
     pub population_size: usize,
     #[arg(long, default_value_t = 800)]
@@ -107,7 +96,7 @@ pub struct ExperimentConfig {
     pub fitness_cache_capacity: usize,
     #[arg(long)]
     pub max_evaluation_smarts_len: Option<usize>,
-    #[arg(long, default_value_t = 3_000)]
+    #[arg(long, default_value_t = 1_000)]
     pub match_time_limit_millis: u64,
     #[arg(long)]
     pub disable_match_time_limit: bool,
@@ -172,9 +161,10 @@ pub struct SplitCounts {
 pub struct CandidateScore {
     pub smarts: String,
     pub smarts_len: usize,
-    pub train_mcc: f64,
-    pub validation_mcc: f64,
+    pub training_mcc: f64,
+    pub training_coverage_score: f64,
     pub test_mcc: f64,
+    pub test_coverage_score: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -182,18 +172,18 @@ pub struct CompletedTaskReport {
     pub head: LabelHead,
     pub label_id: u16,
     pub label_name: String,
-    pub selection_strategy: SelectionStrategy,
     pub generations: u64,
-    pub train_counts: SplitCounts,
-    pub validation_counts: SplitCounts,
+    pub training_counts: SplitCounts,
     pub test_counts: SplitCounts,
-    pub train_best_smarts: String,
-    pub train_best_mcc: f64,
+    pub training_best_smarts: String,
+    pub training_best_mcc: f64,
+    pub training_best_coverage_score: f64,
     pub selected_smarts: String,
     pub selected_smarts_len: usize,
-    pub selected_train_mcc: f64,
-    pub selected_validation_mcc: f64,
+    pub selected_training_mcc: f64,
+    pub selected_training_coverage_score: f64,
     pub selected_test_mcc: f64,
+    pub selected_test_coverage_score: f64,
     pub candidates: Vec<CandidateScore>,
 }
 
@@ -203,8 +193,7 @@ pub struct SkippedTaskReport {
     pub label_id: u16,
     pub label_name: String,
     pub reason: String,
-    pub train_counts: SplitCounts,
-    pub validation_counts: SplitCounts,
+    pub training_counts: SplitCounts,
     pub test_counts: SplitCounts,
 }
 
@@ -236,8 +225,7 @@ pub struct ExperimentSummary {
 struct LoadedInputs {
     downloaded_files: Vec<DownloadedDatasetFile>,
     vocabulary: Vocabulary,
-    train: DatasetSplit,
-    validation: DatasetSplit,
+    training: DatasetSplit,
     test: DatasetSplit,
 }
 
@@ -323,18 +311,12 @@ impl ExperimentProgress {
         }
     }
 
-    fn start_task(
-        &self,
-        task_name: &str,
-        train_len: usize,
-        validation_len: usize,
-        test_len: usize,
-    ) {
+    fn start_task(&self, task_name: &str, training_len: usize, test_len: usize) {
         self.overall_bar.set_message(task_name.to_owned());
         self.task_bar.set_length(1);
         self.task_bar.set_position(0);
         self.task_bar.set_message(format!(
-            "{task_name} | preparing sampled task sets | train={train_len} validation={validation_len} test={test_len}"
+            "{task_name} | preparing sampled task sets | training={training_len} test={test_len}"
         ));
         self.task_bar.tick();
     }
@@ -354,14 +336,15 @@ impl ExperimentProgress {
 
     fn log_done(&self, report: &CompletedTaskReport) {
         self.log_line(format!(
-            "[done] {}:{}:{} | selected={} | train={:.4} validation={:.4} test={:.4}",
+            "[done] {}:{}:{} | selected={} | training_mcc={:.4} training_coverage={:.4} test_mcc={:.4} test_coverage={:.4}",
             report.head.as_str(),
             report.label_id,
             report.label_name,
             report.selected_smarts,
-            report.selected_train_mcc,
-            report.selected_validation_mcc,
-            report.selected_test_mcc
+            report.selected_training_mcc,
+            report.selected_training_coverage_score,
+            report.selected_test_mcc,
+            report.selected_test_coverage_score
         ));
         self.overall_bar.inc(1);
     }
@@ -388,8 +371,7 @@ struct TaskRunContext<'a> {
 
 #[derive(Debug, Clone)]
 struct TaskSplitCounts {
-    train: SplitCounts,
-    validation: SplitCounts,
+    training: SplitCounts,
     test: SplitCounts,
 }
 
@@ -399,7 +381,7 @@ struct PlannedLabelTask {
     head: LabelHead,
     label_id: u16,
     label_name: String,
-    train_positives: usize,
+    training_positives: usize,
     total_positives: usize,
 }
 
@@ -454,13 +436,13 @@ async fn load_inputs(config: &ExperimentConfig) -> Result<LoadedInputs, Experime
     let train = loading_progress.load_split(&config.data_dir.join("train.parquet"), "train")?;
     let validation =
         loading_progress.load_split(&config.data_dir.join("validation.parquet"), "validation")?;
+    let training = DatasetSplit::concatenate("training", vec![train, validation]);
     let test = loading_progress.load_split(&config.data_dir.join("test.parquet"), "test")?;
     loading_progress.finish();
     Ok(LoadedInputs {
         downloaded_files,
         vocabulary,
-        train,
-        validation,
+        training,
         test,
     })
 }
@@ -524,30 +506,24 @@ fn run_label_task(
         inputs,
     } = task_context;
     let task_name = task.task_name();
-    progress.start_task(
-        &task_name,
-        inputs.train.len(),
-        inputs.validation.len(),
-        inputs.test.len(),
-    );
+    progress.start_task(&task_name, inputs.training.len(), inputs.test.len());
 
     let counts = sampled_counts_for_task(task_context, &task_name, task.head, task.label_id);
 
-    if let Some(reason) = skip_reason(config, &counts.train, &counts.validation, &counts.test) {
+    if let Some(reason) = skip_reason(config, &counts.training, &counts.test) {
         let skipped = SkippedTaskReport {
             head: task.head,
             label_id: task.label_id,
             label_name: task.label_name.clone(),
             reason,
-            train_counts: counts.train,
-            validation_counts: counts.validation,
+            training_counts: counts.training,
             test_counts: counts.test,
         };
         progress.log_skip(&task_name, &skipped.reason);
         return Ok(TaskOutcome::Skipped(skipped));
     }
 
-    let train_fold = inputs.train.build_sampled_fold_with_progress(
+    let training_fold = inputs.training.build_sampled_fold_with_progress(
         task.head,
         task.label_id,
         config.max_positives_per_npc_class,
@@ -556,48 +532,41 @@ fn run_label_task(
     )?;
     let result = evolve_fold_with_progress(
         &task_name,
-        train_fold.fold,
+        training_fold.fold,
         evolution_config,
         seed_corpus,
         config.leaderboard_size,
         task_context.progress,
     )?;
 
-    let (validation_evaluator, test_evaluator) =
-        build_holdout_evaluators(task_context, task.head, task.label_id)?;
+    let test_evaluator = build_test_evaluator(task_context, task.head, task.label_id)?;
     let candidates = evaluate_candidates(
         &task_name,
         result.leaders(),
-        &validation_evaluator,
         &test_evaluator,
         task_context.progress,
     )?;
-    let selected = select_candidate(
-        config.selection_strategy,
-        &task_name,
-        &result,
-        &candidates,
-        &validation_evaluator,
-        &test_evaluator,
-    )?;
-    let selected_train_mcc = selected.train_mcc;
+    let selected = select_candidate(&task_name, &result, &test_evaluator)?;
+    let selected_training_mcc = selected.training_mcc;
+    let selected_training_coverage_score = selected.training_coverage_score;
+    let selected_test_coverage_score = selected.test_coverage_score;
 
     let report = CompletedTaskReport {
         head: task.head,
         label_id: task.label_id,
         label_name: task.label_name.clone(),
-        selection_strategy: config.selection_strategy,
         generations: result.generations(),
-        train_counts: counts.train,
-        validation_counts: counts.validation,
+        training_counts: counts.training,
         test_counts: counts.test,
-        train_best_smarts: result.best_smarts().to_owned(),
-        train_best_mcc: result.best_mcc(),
+        training_best_smarts: result.best_smarts().to_owned(),
+        training_best_mcc: result.best_mcc(),
+        training_best_coverage_score: result.best_coverage_score(),
         selected_smarts: selected.smarts.clone(),
         selected_smarts_len: selected.smarts_len,
-        selected_train_mcc,
-        selected_validation_mcc: selected.validation_mcc,
+        selected_training_mcc,
+        selected_training_coverage_score,
         selected_test_mcc: selected.test_mcc,
+        selected_test_coverage_score,
         candidates,
     };
     progress.log_done(&report);
@@ -615,8 +584,7 @@ fn sorted_task_plan(
     for head in LabelHead::ALL {
         let labels = vocabulary.labels(head);
         let max_labels = config.max_labels_per_head.unwrap_or(labels.len());
-        let train_positives = inputs.train.label_positive_counts(head, labels.len());
-        let validation_positives = inputs.validation.label_positive_counts(head, labels.len());
+        let training_positives = inputs.training.label_positive_counts(head, labels.len());
         let test_positives = inputs.test.label_positive_counts(head, labels.len());
 
         for (label_index, label_name) in labels.iter().enumerate().take(max_labels) {
@@ -626,8 +594,8 @@ fn sorted_task_plan(
                     head.as_str()
                 ))
             })?;
-            let train_count = train_positives[label_index];
-            if train_count < config.min_train_positives {
+            let training_count = training_positives[label_index];
+            if training_count < config.min_train_positives {
                 continue;
             }
             tasks.push(PlannedLabelTask {
@@ -635,10 +603,8 @@ fn sorted_task_plan(
                 head,
                 label_id,
                 label_name: label_name.clone(),
-                train_positives: train_count,
-                total_positives: train_count
-                    + validation_positives[label_index]
-                    + test_positives[label_index],
+                training_positives: training_count,
+                total_positives: training_count + test_positives[label_index],
             });
         }
     }
@@ -652,8 +618,8 @@ fn sort_task_plan(tasks: &mut [PlannedLabelTask]) {
 }
 
 fn compare_planned_tasks(left: &PlannedLabelTask, right: &PlannedLabelTask) -> Ordering {
-    left.train_positives
-        .cmp(&right.train_positives)
+    left.training_positives
+        .cmp(&right.training_positives)
         .then_with(|| left.total_positives.cmp(&right.total_positives))
         .then_with(|| left.ordinal.cmp(&right.ordinal))
 }
@@ -666,11 +632,10 @@ fn sampled_counts_for_task(
 ) -> TaskSplitCounts {
     let inputs = task_context.inputs;
     TaskSplitCounts {
-        train: sampled_counts_from_split(task_context, task_name, &inputs.train, head, label_id),
-        validation: sampled_counts_from_split(
+        training: sampled_counts_from_split(
             task_context,
             task_name,
-            &inputs.validation,
+            &inputs.training,
             head,
             label_id,
         ),
@@ -704,23 +669,13 @@ fn sampled_counts_from_split(
     counts_from_selection_counts(counts)
 }
 
-fn build_holdout_evaluators(
+fn build_test_evaluator(
     task_context: &TaskRunContext<'_>,
     head: LabelHead,
     label_id: u16,
-) -> Result<(SmartsEvaluator, SmartsEvaluator), ExperimentError> {
+) -> Result<SmartsEvaluator, ExperimentError> {
     let config = task_context.config;
     let progress = &task_context.progress.task_bar;
-    let validation_fold = task_context
-        .inputs
-        .validation
-        .build_sampled_fold_with_progress(
-            head,
-            label_id,
-            config.max_positives_per_npc_class,
-            config.max_negatives_per_npc_class,
-            progress,
-        )?;
     let test_fold = task_context.inputs.test.build_sampled_fold_with_progress(
         head,
         label_id,
@@ -728,15 +683,12 @@ fn build_holdout_evaluators(
         config.max_negatives_per_npc_class,
         progress,
     )?;
-    Ok((
-        SmartsEvaluator::new(vec![validation_fold.fold]),
-        SmartsEvaluator::new(vec![test_fold.fold]),
-    ))
+    Ok(SmartsEvaluator::new(vec![test_fold.fold]))
 }
 
 fn evolve_fold_with_progress(
     task_name: &str,
-    train_fold: FoldData,
+    training_fold: FoldData,
     evolution_config: &SmartsEvolutionConfig,
     seed_corpus: &SeedCorpus,
     leaderboard_size: usize,
@@ -747,7 +699,7 @@ fn evolve_fold_with_progress(
         usize::try_from(evolution_config.generation_limit()).unwrap_or(usize::MAX),
         format!("{task_name} | evolution progress from smarts-evolution"),
     );
-    let task = EvolutionTask::new(task_name.to_owned(), vec![train_fold]);
+    let task = EvolutionTask::new(task_name.to_owned(), vec![training_fold]);
     let evolution_progress = IndicatifEvolutionProgress::attach_to(&progress.multi_progress)
         .with_best_smarts_width(72)
         .clear_on_finish(true);
@@ -787,20 +739,13 @@ fn counts_from_selection_counts(counts: FoldSelectionCounts) -> SplitCounts {
 
 fn skip_reason(
     config: &ExperimentConfig,
-    train: &SplitCounts,
-    validation: &SplitCounts,
+    training: &SplitCounts,
     test: &SplitCounts,
 ) -> Option<String> {
-    if train.positives < config.min_train_positives {
+    if training.positives < config.min_train_positives {
         return Some(format!(
-            "train positives {} < required {}",
-            train.positives, config.min_train_positives
-        ));
-    }
-    if validation.positives < config.min_validation_positives {
-        return Some(format!(
-            "validation positives {} < required {}",
-            validation.positives, config.min_validation_positives
+            "training positives {} < required {}",
+            training.positives, config.min_train_positives
         ));
     }
     if test.positives < config.min_test_positives {
@@ -809,11 +754,8 @@ fn skip_reason(
             test.positives, config.min_test_positives
         ));
     }
-    if train.negatives == 0 {
-        return Some("train split has no negatives".to_owned());
-    }
-    if validation.negatives == 0 {
-        return Some("validation split has no negatives".to_owned());
+    if training.negatives == 0 {
+        return Some("training split has no negatives".to_owned());
     }
     if test.negatives == 0 {
         return Some("test split has no negatives".to_owned());
@@ -880,12 +822,11 @@ fn usize_to_u64(value: usize) -> u64 {
 fn evaluate_candidates(
     task_id: &str,
     leaders: &[RankedSmarts],
-    validation_evaluator: &SmartsEvaluator,
     test_evaluator: &SmartsEvaluator,
     progress: &ExperimentProgress,
 ) -> Result<Vec<CandidateScore>, ExperimentError> {
     let mut candidates = Vec::with_capacity(leaders.len());
-    let total_steps = leaders.len().saturating_mul(2);
+    let total_steps = leaders.len();
     progress.set_task_phase(
         task_id,
         total_steps,
@@ -894,21 +835,11 @@ fn evaluate_candidates(
     let mut completed_steps = 0usize;
     for leader in leaders {
         progress.task_bar.set_message(format!(
-            "{task_id} | scoring validation | {}/{}",
-            completed_steps,
-            total_steps.max(1)
-        ));
-        let validation_mcc = evaluate_smarts(task_id, leader.smarts(), validation_evaluator)?;
-        completed_steps += 1;
-        progress
-            .task_bar
-            .set_position(usize_to_u64(completed_steps));
-        progress.task_bar.set_message(format!(
             "{task_id} | scoring test | {}/{}",
             completed_steps,
             total_steps.max(1)
         ));
-        let test_mcc = evaluate_smarts(task_id, leader.smarts(), test_evaluator)?;
+        let test_score = evaluate_smarts(task_id, leader.smarts(), test_evaluator)?;
         completed_steps += 1;
         progress
             .task_bar
@@ -916,9 +847,10 @@ fn evaluate_candidates(
         candidates.push(CandidateScore {
             smarts: leader.smarts().to_owned(),
             smarts_len: leader.smarts_len(),
-            train_mcc: leader.mcc(),
-            validation_mcc,
-            test_mcc,
+            training_mcc: leader.mcc(),
+            training_coverage_score: leader.coverage_score(),
+            test_mcc: test_score.mcc,
+            test_coverage_score: test_score.coverage_score,
         });
     }
     candidates.sort_by(compare_candidates);
@@ -926,56 +858,55 @@ fn evaluate_candidates(
 }
 
 fn select_candidate(
-    strategy: SelectionStrategy,
     task_id: &str,
     result: &smarts_evolution::TaskResult,
-    candidates: &[CandidateScore],
-    validation_evaluator: &SmartsEvaluator,
     test_evaluator: &SmartsEvaluator,
 ) -> Result<CandidateScore, ExperimentError> {
-    match strategy {
-        SelectionStrategy::ValidationBestLeader => candidates.first().cloned().ok_or_else(|| {
-            ExperimentError::InvalidDataset(format!(
-                "task {task_id} did not produce any leader candidates"
-            ))
-        }),
-        SelectionStrategy::TrainBest => Ok(CandidateScore {
-            smarts: result.best_smarts().to_owned(),
-            smarts_len: result.best_smarts_len(),
-            train_mcc: result.best_mcc(),
-            validation_mcc: evaluate_smarts(task_id, result.best_smarts(), validation_evaluator)?,
-            test_mcc: evaluate_smarts(task_id, result.best_smarts(), test_evaluator)?,
-        }),
-    }
+    let test_score = evaluate_smarts(task_id, result.best_smarts(), test_evaluator)?;
+    Ok(CandidateScore {
+        smarts: result.best_smarts().to_owned(),
+        smarts_len: result.best_smarts_len(),
+        training_mcc: result.best_mcc(),
+        training_coverage_score: result.best_coverage_score(),
+        test_mcc: test_score.mcc,
+        test_coverage_score: test_score.coverage_score,
+    })
 }
 
 fn compare_candidates(left: &CandidateScore, right: &CandidateScore) -> Ordering {
     right
-        .validation_mcc
-        .partial_cmp(&left.validation_mcc)
-        .unwrap_or(Ordering::Equal)
-        .then_with(|| left.smarts_len.cmp(&right.smarts_len))
+        .training_mcc
+        .total_cmp(&left.training_mcc)
         .then_with(|| {
             right
-                .train_mcc
-                .partial_cmp(&left.train_mcc)
-                .unwrap_or(Ordering::Equal)
+                .training_coverage_score
+                .total_cmp(&left.training_coverage_score)
         })
+        .then_with(|| left.smarts_len.cmp(&right.smarts_len))
         .then_with(|| left.smarts.cmp(&right.smarts))
+}
+
+struct EvaluationScore {
+    mcc: f64,
+    coverage_score: f64,
 }
 
 fn evaluate_smarts(
     task_id: &str,
     smarts: &str,
     evaluator: &SmartsEvaluator,
-) -> Result<f64, ExperimentError> {
+) -> Result<EvaluationScore, ExperimentError> {
     let genome =
         SmartsGenome::from_smarts(smarts).map_err(|message| ExperimentError::InvalidSmarts {
             task_id: task_id.to_owned(),
             smarts: smarts.to_owned(),
             message,
         })?;
-    Ok(evaluator.evaluate(&genome).fitness().mcc())
+    let evaluation = evaluator.evaluate(&genome);
+    Ok(EvaluationScore {
+        mcc: evaluation.fitness().mcc(),
+        coverage_score: evaluation.coverage_score(),
+    })
 }
 
 fn append_json_line(path: &Path, value: &(impl Serialize + ?Sized)) -> Result<(), ExperimentError> {
@@ -1013,12 +944,10 @@ mod tests {
             output_dir: PathBuf::from("artifacts"),
             max_labels_per_head: None,
             min_train_positives: 50,
-            min_validation_positives: 1,
             min_test_positives: 1,
             max_positives_per_npc_class: 512,
             max_negatives_per_npc_class: 512,
             leaderboard_size: 32,
-            selection_strategy: SelectionStrategy::ValidationBestLeader,
             population_size: 1024,
             generation_limit: 800,
             mutation_rate: 0.90,
@@ -1031,7 +960,7 @@ mod tests {
             rng_seed: None,
             fitness_cache_capacity: 500_000,
             max_evaluation_smarts_len: None,
-            match_time_limit_millis: 3_000,
+            match_time_limit_millis: 1_000,
             disable_match_time_limit: false,
             slow_evaluation_log_threshold_millis: 30_000,
             disable_slow_evaluation_logging: false,
@@ -1161,8 +1090,7 @@ mod tests {
         LoadedInputs {
             downloaded_files: Vec::new(),
             vocabulary,
-            train,
-            validation,
+            training: DatasetSplit::concatenate("training", vec![train, validation]),
             test,
         }
     }
@@ -1171,8 +1099,7 @@ mod tests {
         ordinal: usize,
         label_id: u16,
         label_name: &str,
-        train_positives: usize,
-        validation_positives: usize,
+        training_positives: usize,
         test_positives: usize,
     ) -> PlannedLabelTask {
         PlannedLabelTask {
@@ -1180,8 +1107,8 @@ mod tests {
             head: LabelHead::Class,
             label_id,
             label_name: label_name.to_owned(),
-            train_positives,
-            total_positives: train_positives + validation_positives + test_positives,
+            training_positives,
+            total_positives: training_positives + test_positives,
         }
     }
 
@@ -1192,13 +1119,9 @@ mod tests {
     ) -> PlannedLabelTask {
         let label_index = usize::from(label_id);
         let label_count = label_index + 1;
-        let train_positives = task_context
+        let training_positives = task_context
             .inputs
-            .train
-            .label_positive_counts(LabelHead::Class, label_count)[label_index];
-        let validation_positives = task_context
-            .inputs
-            .validation
+            .training
             .label_positive_counts(LabelHead::Class, label_count)[label_index];
         let test_positives = task_context
             .inputs
@@ -1209,8 +1132,8 @@ mod tests {
             head: LabelHead::Class,
             label_id,
             label_name: label_name.to_owned(),
-            train_positives,
-            total_positives: train_positives + validation_positives + test_positives,
+            training_positives,
+            total_positives: training_positives + test_positives,
         }
     }
 
@@ -1274,15 +1197,18 @@ mod tests {
         assert!(validation.is_ok());
         let test = DatasetSplit::load(&temp_dir.join("test.parquet"), "test");
         assert!(test.is_ok());
+        let Ok(train) = train else { unreachable!() };
+        let Ok(validation) = validation else {
+            unreachable!()
+        };
         let inputs = LoadedInputs {
             downloaded_files: Vec::new(),
             vocabulary: vocabulary.unwrap_or_else(|_| unreachable!()),
-            train: train.unwrap_or_else(|_| unreachable!()),
-            validation: validation.unwrap_or_else(|_| unreachable!()),
+            training: DatasetSplit::concatenate("training", vec![train, validation]),
             test: test.unwrap_or_else(|_| unreachable!()),
         };
         let mut config = baseline_config();
-        config.min_train_positives = 2;
+        config.min_train_positives = 3;
 
         let task_plan = sorted_task_plan(&config, &inputs);
         assert!(task_plan.is_ok());
@@ -1298,14 +1224,14 @@ mod tests {
     #[test]
     fn task_plan_sort_starts_with_fewest_training_examples() {
         let mut tasks = vec![
-            planned_task(0, 0, "many", 10, 1, 1),
-            planned_task(1, 1, "few", 2, 4, 4),
-            planned_task(2, 2, "same_train_fewer_total", 2, 1, 1),
+            planned_task(0, 0, "many", 10, 1),
+            planned_task(1, 1, "few", 2, 4),
+            planned_task(2, 2, "same_training_fewer_total", 2, 1),
         ];
 
         sort_task_plan(&mut tasks);
 
-        assert_eq!(tasks[0].label_name, "same_train_fewer_total");
+        assert_eq!(tasks[0].label_name, "same_training_fewer_total");
         assert_eq!(tasks[1].label_name, "few");
         assert_eq!(tasks[2].label_name, "many");
     }
@@ -1322,7 +1248,7 @@ mod tests {
         assert_eq!(built.tournament_size(), 5);
         assert_eq!(built.elite_count(), 8);
         assert_eq!(built.fitness_cache_capacity(), 500_000);
-        assert_eq!(built.match_time_limit(), Some(Duration::from_secs(3)));
+        assert_eq!(built.match_time_limit(), Some(Duration::from_secs(1)));
         assert_eq!(
             built.slow_evaluation_log_threshold(),
             Some(Duration::from_secs(30))
@@ -1380,14 +1306,8 @@ mod tests {
             head: LabelHead::Class,
             label_id: 0,
             label_name: String::from("test"),
-            selection_strategy: SelectionStrategy::ValidationBestLeader,
             generations: 1,
-            train_counts: SplitCounts {
-                rows: 2,
-                positives: 1,
-                negatives: 1,
-            },
-            validation_counts: SplitCounts {
+            training_counts: SplitCounts {
                 rows: 2,
                 positives: 1,
                 negatives: 1,
@@ -1397,13 +1317,15 @@ mod tests {
                 positives: 1,
                 negatives: 1,
             },
-            train_best_smarts: String::from("[#6]"),
-            train_best_mcc: 1.0,
+            training_best_smarts: String::from("[#6]"),
+            training_best_mcc: 1.0,
+            training_best_coverage_score: 1.0,
             selected_smarts: String::from("[#6]"),
             selected_smarts_len: 4,
-            selected_train_mcc: 1.0,
-            selected_validation_mcc: 1.0,
+            selected_training_mcc: 1.0,
+            selected_training_coverage_score: 1.0,
             selected_test_mcc: 1.0,
+            selected_test_coverage_score: 1.0,
             candidates: Vec::new(),
         };
         let skipped = SkippedTaskReport {
@@ -1411,12 +1333,7 @@ mod tests {
             label_id: 1,
             label_name: String::from("skip"),
             reason: String::from("not enough positives"),
-            train_counts: SplitCounts {
-                rows: 1,
-                positives: 0,
-                negatives: 1,
-            },
-            validation_counts: SplitCounts {
+            training_counts: SplitCounts {
                 rows: 1,
                 positives: 0,
                 negatives: 1,
@@ -1436,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn skip_reason_reports_negative_only_train_fold() {
+    fn skip_reason_reports_too_few_training_positives() {
         let mut config = baseline_config();
         config.min_train_positives = 2;
         let reason = skip_reason(
@@ -1451,43 +1368,41 @@ mod tests {
                 positives: 1,
                 negatives: 1,
             },
-            &SplitCounts {
-                rows: 2,
-                positives: 1,
-                negatives: 1,
-            },
         );
-        assert_eq!(reason.as_deref(), Some("train positives 1 < required 2"));
+        assert_eq!(reason.as_deref(), Some("training positives 1 < required 2"));
     }
 
     #[test]
-    fn compare_candidates_prefers_validation_then_simplicity() {
+    fn compare_candidates_prefers_training_then_coverage_then_simplicity() {
         let mut candidates = [
             CandidateScore {
                 smarts: String::from("[#6]~[#7]"),
                 smarts_len: 9,
-                train_mcc: 0.9,
-                validation_mcc: 0.8,
+                training_mcc: 0.8,
+                training_coverage_score: 0.9,
                 test_mcc: 0.7,
+                test_coverage_score: 0.6,
             },
             CandidateScore {
                 smarts: String::from("[#7]"),
                 smarts_len: 4,
-                train_mcc: 0.7,
-                validation_mcc: 0.8,
+                training_mcc: 0.8,
+                training_coverage_score: 0.8,
                 test_mcc: 0.7,
+                test_coverage_score: 0.7,
             },
             CandidateScore {
                 smarts: String::from("[#8]"),
                 smarts_len: 4,
-                train_mcc: 1.0,
-                validation_mcc: 0.6,
+                training_mcc: 0.6,
+                training_coverage_score: 1.0,
                 test_mcc: 0.6,
+                test_coverage_score: 0.6,
             },
         ];
         candidates.sort_by(compare_candidates);
-        assert_eq!(candidates[0].smarts, "[#7]");
-        assert_eq!(candidates[1].smarts, "[#6]~[#7]");
+        assert_eq!(candidates[0].smarts, "[#6]~[#7]");
+        assert_eq!(candidates[1].smarts, "[#7]");
     }
 
     #[test]
@@ -1506,13 +1421,8 @@ mod tests {
                 positives: 1,
                 negatives: 1,
             },
-            &SplitCounts {
-                rows: 2,
-                positives: 1,
-                negatives: 1,
-            },
         );
-        assert_eq!(reason.as_deref(), Some("train split has no negatives"));
+        assert_eq!(reason.as_deref(), Some("training split has no negatives"));
     }
 
     #[test]
@@ -1606,8 +1516,7 @@ mod tests {
         };
         assert_eq!(report.head, LabelHead::Class);
         assert_eq!(report.label_id, 0);
-        assert_eq!(report.train_counts.positives, 2);
-        assert_eq!(report.validation_counts.positives, 1);
+        assert_eq!(report.training_counts.positives, 3);
         assert_eq!(report.test_counts.positives, 1);
         assert!(!report.selected_smarts.is_empty());
         assert!(!report.candidates.is_empty());

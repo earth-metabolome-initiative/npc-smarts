@@ -1907,7 +1907,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smarts-evolution"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-evolution?branch=main#b0878975ee6a2d7dd203192e8c2f0f562d7d0b00"
+source = "git+https://github.com/earth-metabolome-initiative/smarts-evolution?branch=main#89425edddb909552eaea590b59a48bccd4f731f6"
 dependencies = [
  "elements_rs",
  "getrandom 0.4.2",
@@ -1923,7 +1923,7 @@ dependencies = [
 [[package]]
 name = "smarts-rs"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#35372a30dcc086f86487428b32b624e0cdb3d119"
+source = "git+https://github.com/earth-metabolome-initiative/smarts-rs?branch=main#27c0c1da824ca6c1139d769bd8ebadb4586bb42c"
 dependencies = [
  "elements_rs",
  "geometric-traits",

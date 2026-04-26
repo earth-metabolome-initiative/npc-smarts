@@ -152,6 +152,19 @@ impl DatasetSplit {
     }
 
     #[must_use]
+    pub fn concatenate(name: impl Into<String>, splits: Vec<Self>) -> Self {
+        let row_count = splits.iter().map(Self::len).sum();
+        let mut rows = Vec::with_capacity(row_count);
+        for split in splits {
+            rows.extend(split.rows);
+        }
+        Self {
+            name: name.into(),
+            rows,
+        }
+    }
+
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }

@@ -11,6 +11,5 @@ pub use download::{
     DownloadedDatasetFile, ensure_distillation_dataset, missing_distillation_dataset_files,
 };
 pub use experiment::{
-    ExperimentConfig, ExperimentError, ExperimentSummary, SelectionStrategy, TaskLogEntry,
-    TaskOutcome, run_experiment,
+    ExperimentConfig, ExperimentError, ExperimentSummary, TaskLogEntry, TaskOutcome, run_experiment,
 };
