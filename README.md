@@ -23,8 +23,8 @@ with `--min-train-positives`.
 Results report both MCC and match coverage scores for the merged training pool
 and held-out test split.
 
-Slow SMARTS warnings are logged by default after 30 seconds. SMARTS matching
-also has a cooperative 200 ms per-match time limit by default, and SMARTS
+Slow SMARTS warnings are logged by default after 30 seconds. Each SMARTS
+evaluation also has a cooperative 1 second time limit by default, and SMARTS
 length can be capped before evaluation. Use
 `--slow-evaluation-log-threshold-millis`, `--match-time-limit-millis`, and
 `--max-evaluation-smarts-len` to tune evaluation guardrails. The run writes

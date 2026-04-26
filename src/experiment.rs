@@ -96,7 +96,7 @@ pub struct ExperimentConfig {
     pub fitness_cache_capacity: usize,
     #[arg(long)]
     pub max_evaluation_smarts_len: Option<usize>,
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = 1_000)]
     pub match_time_limit_millis: u64,
     #[arg(long)]
     pub disable_match_time_limit: bool,
@@ -960,7 +960,7 @@ mod tests {
             rng_seed: None,
             fitness_cache_capacity: 500_000,
             max_evaluation_smarts_len: None,
-            match_time_limit_millis: 200,
+            match_time_limit_millis: 1_000,
             disable_match_time_limit: false,
             slow_evaluation_log_threshold_millis: 30_000,
             disable_slow_evaluation_logging: false,
@@ -1248,7 +1248,7 @@ mod tests {
         assert_eq!(built.tournament_size(), 5);
         assert_eq!(built.elite_count(), 8);
         assert_eq!(built.fitness_cache_capacity(), 500_000);
-        assert_eq!(built.match_time_limit(), Some(Duration::from_millis(200)));
+        assert_eq!(built.match_time_limit(), Some(Duration::from_secs(1)));
         assert_eq!(
             built.slow_evaluation_log_threshold(),
             Some(Duration::from_secs(30))
