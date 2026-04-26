@@ -68,7 +68,7 @@ pub struct ExperimentConfig {
     pub min_test_positives: usize,
     #[arg(long, default_value_t = 512)]
     pub max_positives_per_npc_class: usize,
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 2_048)]
     pub max_negatives_per_npc_class: usize,
     #[arg(long, default_value_t = 32)]
     pub leaderboard_size: usize,
@@ -96,7 +96,7 @@ pub struct ExperimentConfig {
     pub fitness_cache_capacity: usize,
     #[arg(long)]
     pub max_evaluation_smarts_len: Option<usize>,
-    #[arg(long, default_value_t = 1_000)]
+    #[arg(long, default_value_t = 200)]
     pub match_time_limit_millis: u64,
     #[arg(long)]
     pub disable_match_time_limit: bool,
@@ -946,7 +946,7 @@ mod tests {
             min_train_positives: 50,
             min_test_positives: 1,
             max_positives_per_npc_class: 512,
-            max_negatives_per_npc_class: 512,
+            max_negatives_per_npc_class: 2_048,
             leaderboard_size: 32,
             population_size: 1024,
             generation_limit: 800,
@@ -960,7 +960,7 @@ mod tests {
             rng_seed: None,
             fitness_cache_capacity: 500_000,
             max_evaluation_smarts_len: None,
-            match_time_limit_millis: 1_000,
+            match_time_limit_millis: 200,
             disable_match_time_limit: false,
             slow_evaluation_log_threshold_millis: 30_000,
             disable_slow_evaluation_logging: false,
@@ -1248,7 +1248,7 @@ mod tests {
         assert_eq!(built.tournament_size(), 5);
         assert_eq!(built.elite_count(), 8);
         assert_eq!(built.fitness_cache_capacity(), 500_000);
-        assert_eq!(built.match_time_limit(), Some(Duration::from_secs(1)));
+        assert_eq!(built.match_time_limit(), Some(Duration::from_millis(200)));
         assert_eq!(
             built.slow_evaluation_log_threshold(),
             Some(Duration::from_secs(30))
