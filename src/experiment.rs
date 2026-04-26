@@ -124,7 +124,8 @@ impl ExperimentConfig {
             .elite_count(self.elite_count)
             .random_immigrant_ratio(self.random_immigrant_ratio)
             .stagnation_limit(self.stagnation_limit)
-            .fitness_cache_capacity(self.fitness_cache_capacity);
+            .fitness_cache_capacity(self.fitness_cache_capacity)
+            .pubchem_compatible_smarts(true);
         if let Some(seed) = self.rng_seed {
             builder = builder.rng_seed(seed);
         }
@@ -1247,6 +1248,7 @@ mod tests {
         assert_eq!(built.tournament_size(), 5);
         assert_eq!(built.elite_count(), 8);
         assert_eq!(built.fitness_cache_capacity(), 500_000);
+        assert!(built.pubchem_compatible_smarts());
         assert_eq!(built.match_time_limit(), Some(Duration::from_secs(1)));
         assert_eq!(
             built.slow_evaluation_log_threshold(),

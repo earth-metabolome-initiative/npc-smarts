@@ -23,6 +23,9 @@ with `--min-train-positives`.
 Results report both MCC and match coverage scores for the merged training pool
 and held-out test split.
 
+Generated SMARTS are restricted to the conservative PubChem-compatible subset
+provided by `smarts-evolution`.
+
 Slow SMARTS warnings are logged by default after 30 seconds. Each SMARTS
 evaluation also has a cooperative 1 second time limit by default, and SMARTS
 length can be capped before evaluation. Use
