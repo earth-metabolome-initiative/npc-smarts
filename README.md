@@ -14,7 +14,7 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release
 ```
 
 By default, each training/test task set includes all positives and samples up
-to 4096 negatives per NPC class. Override negative sampling with
+to 8192 negatives per NPC class. Override negative sampling with
 `--max-negatives-per-npc-class`.
 
 Labels with fewer than 50 training examples are filtered out by default. Override

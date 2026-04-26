@@ -68,7 +68,7 @@ pub struct ExperimentConfig {
     pub min_train_positives: usize,
     #[arg(long, default_value_t = 1)]
     pub min_test_positives: usize,
-    #[arg(long, default_value_t = 4_096)]
+    #[arg(long, default_value_t = 8_192)]
     pub max_negatives_per_npc_class: usize,
     #[arg(long, default_value_t = 32)]
     pub leaderboard_size: usize,
@@ -946,7 +946,7 @@ mod tests {
             max_labels_per_head: None,
             min_train_positives: 50,
             min_test_positives: 1,
-            max_negatives_per_npc_class: 4_096,
+            max_negatives_per_npc_class: 8_192,
             leaderboard_size: 32,
             population_size: 2048,
             generation_limit: 800,
