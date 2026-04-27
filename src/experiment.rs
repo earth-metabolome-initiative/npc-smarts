@@ -72,23 +72,23 @@ pub struct ExperimentConfig {
     pub max_negatives_per_npc_class: usize,
     #[arg(long, default_value_t = 32)]
     pub leaderboard_size: usize,
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, default_value_t = 1024)]
     pub population_size: usize,
-    #[arg(long, default_value_t = 800)]
+    #[arg(long, default_value_t = 500)]
     pub generation_limit: u64,
-    #[arg(long, default_value_t = 0.90)]
+    #[arg(long, default_value_t = 0.85)]
     pub mutation_rate: f64,
-    #[arg(long, default_value_t = 0.75)]
+    #[arg(long, default_value_t = 0.70)]
     pub crossover_rate: f64,
-    #[arg(long, default_value_t = 0.35)]
+    #[arg(long, default_value_t = 0.50)]
     pub selection_ratio: f64,
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 3)]
     pub tournament_size: usize,
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 4)]
     pub elite_count: usize,
-    #[arg(long, default_value_t = 0.20)]
+    #[arg(long, default_value_t = 0.10)]
     pub random_immigrant_ratio: f64,
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = 50)]
     pub stagnation_limit: u64,
     #[arg(long)]
     pub rng_seed: Option<u64>,
@@ -948,15 +948,15 @@ mod tests {
             min_test_positives: 1,
             max_negatives_per_npc_class: 16_384,
             leaderboard_size: 32,
-            population_size: 2048,
-            generation_limit: 800,
-            mutation_rate: 0.90,
-            crossover_rate: 0.75,
-            selection_ratio: 0.35,
-            tournament_size: 5,
-            elite_count: 8,
-            random_immigrant_ratio: 0.20,
-            stagnation_limit: 120,
+            population_size: 1024,
+            generation_limit: 500,
+            mutation_rate: 0.85,
+            crossover_rate: 0.70,
+            selection_ratio: 0.50,
+            tournament_size: 3,
+            elite_count: 4,
+            random_immigrant_ratio: 0.10,
+            stagnation_limit: 50,
             rng_seed: None,
             fitness_cache_capacity: 500_000,
             max_evaluation_smarts_len: None,
@@ -1237,16 +1237,16 @@ mod tests {
     }
 
     #[test]
-    fn evolution_config_uses_aggressive_defaults() {
+    fn evolution_config_uses_tuned_defaults() {
         let config = baseline_config();
         let built = config.evolution_config();
         assert!(built.is_ok());
         let Ok(built) = built else { unreachable!() };
-        assert_eq!(built.population_size(), 2048);
-        assert_eq!(built.generation_limit(), 800);
-        assert_eq!(built.stagnation_limit(), 120);
-        assert_eq!(built.tournament_size(), 5);
-        assert_eq!(built.elite_count(), 8);
+        assert_eq!(built.population_size(), 1024);
+        assert_eq!(built.generation_limit(), 500);
+        assert_eq!(built.stagnation_limit(), 50);
+        assert_eq!(built.tournament_size(), 3);
+        assert_eq!(built.elite_count(), 4);
         assert_eq!(built.fitness_cache_capacity(), 500_000);
         assert!(built.pubchem_compatible_smarts());
         assert_eq!(built.match_time_limit(), Some(Duration::from_secs(1)));
@@ -1255,10 +1255,10 @@ mod tests {
             Some(Duration::from_secs(30))
         );
         assert_eq!(built.max_evaluation_smarts_len(), None);
-        assert!((built.mutation_rate() - 0.90).abs() < f64::EPSILON);
-        assert!((built.crossover_rate() - 0.75).abs() < f64::EPSILON);
-        assert!((built.selection_ratio() - 0.35).abs() < f64::EPSILON);
-        assert!((built.random_immigrant_ratio() - 0.20).abs() < f64::EPSILON);
+        assert!((built.mutation_rate() - 0.85).abs() < f64::EPSILON);
+        assert!((built.crossover_rate() - 0.70).abs() < f64::EPSILON);
+        assert!((built.selection_ratio() - 0.50).abs() < f64::EPSILON);
+        assert!((built.random_immigrant_ratio() - 0.10).abs() < f64::EPSILON);
     }
 
     #[test]

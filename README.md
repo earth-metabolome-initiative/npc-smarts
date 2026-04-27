@@ -5,7 +5,7 @@
 [![Dataset DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19701295.svg)](https://doi.org/10.5281/zenodo.19701295)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`npc-smarts` downloads the distilled `NPClassifier` train/validation/test splits from Zenodo and evolves one-vs-rest SMARTS for NPC pathway, superclass, and class labels with aggressive fixed GA defaults. The published train and validation splits are merged into one training pool, and the test split is held out for reporting.
+`npc-smarts` downloads the distilled `NPClassifier` train/validation/test splits from Zenodo and evolves one-vs-rest SMARTS for NPC pathway, superclass, and class labels with fixed GA defaults. The published train and validation splits are merged into one training pool, and the test split is held out for reporting.
 
 ## Run
 
@@ -19,6 +19,9 @@ to 16384 negatives per NPC class. Override negative sampling with
 
 Labels with fewer than 50 training examples are filtered out by default. Override
 with `--min-train-positives`.
+
+The default GA evaluates 1024 SMARTS per generation for up to 500 generations,
+with early stopping after 50 stagnant generations.
 
 Results report both MCC and match coverage scores for the merged training pool
 and held-out test split.
